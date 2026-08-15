@@ -8,6 +8,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -61,3 +62,64 @@ jobs:
       # handshake test) must compile too, not just the libraries.
       - name: cargo check
         run: cargo check --workspace --all-targets --locked
+
+  # Builds the self-contained Windows installer (corcel.exe + bundled
+  # GStreamer runtime, see packaging/windows/): on demand via
+  # workflow_dispatch (grab it from the run's artifacts), and on v* tags,
+  # where it's also attached to a GitHub release for friends to download.
+  package-windows:
+    name: installer (windows)
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer (MSVC), pkg-config, Inno Setup
+        run: choco install -y --no-progress gstreamer gstreamer-devel pkgconfiglite innosetup
+
+      - name: Expose GStreamer to cargo
+        shell: pwsh
+        run: |
+          $root = [Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64', 'Machine')
+          if (-not $root -or -not (Test-Path "$root\lib\pkgconfig")) {
+            $candidate = Get-ChildItem 'C:\gstreamer\1.0' -Directory -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path "$($_.FullName)\lib\pkgconfig" } |
+              Select-Object -First 1
+            $root = $candidate?.FullName
+          }
+          if (-not $root) { Write-Error 'no GStreamer dev install found' }
+          Write-Host "GStreamer root: $root"
+          Add-Content $env:GITHUB_ENV "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root"
+          Add-Content $env:GITHUB_ENV "PKG_CONFIG_PATH=$root\lib\pkgconfig"
+          Add-Content $env:GITHUB_PATH "$root\bin"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Stage distribution
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\package.ps1
+
+      - name: Build installer
+        shell: pwsh
+        run: iscc packaging\windows\corcel.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corcel-setup
+          path: dist/corcel-setup.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/corcel-setup.exe --generate-notes

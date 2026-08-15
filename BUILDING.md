@@ -100,3 +100,21 @@ Things to know on Windows:
 - **Screen share** uses Windows Graphics Capture: primary monitor only
   for now (same simplification as macOS), and Windows 11 draws its
   yellow "being captured" border — that's the OS, not corcel.
+
+## Windows installer (for people who just want to use corcel)
+
+Nobody installing corcel needs any of the setup above — that's all
+build-time. `packaging/windows/` produces a self-contained installer
+(corcel.exe with the GStreamer runtime DLLs bundled beside it, Discord-
+style):
+
+```powershell
+cargo build --release
+powershell -ExecutionPolicy Bypass -File packaging\windows\package.ps1
+iscc packaging\windows\corcel.iss   # -> dist\corcel-setup.exe
+```
+
+CI builds the same installer on demand (run the "CI" workflow manually
+and grab the `corcel-setup` artifact) and attaches it to a GitHub
+release on every `v*` tag. The only thing the installer can't do for a
+user is accept the Windows firewall prompt on first launch.

@@ -17,7 +17,29 @@ use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOption
 
 use shell::Shell;
 
+/// Points GStreamer at the plugin DLLs an installer ships next to the exe
+/// (`lib\gstreamer-1.0\`, staged by `packaging/windows/package.ps1`), so
+/// installed copies need no GStreamer on the machine and no environment
+/// setup. The core DLLs next to the exe are found by the OS loader on its
+/// own — plugins are the one part GStreamer locates itself, via this env
+/// var, which must be set before [`corcel_media::init`]. A dev build (no
+/// bundled dir) or an explicit GST_PLUGIN_PATH leaves everything as is.
+#[cfg(target_os = "windows")]
+fn use_bundled_gstreamer() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let plugins = dir.join("lib").join("gstreamer-1.0");
+    if plugins.is_dir() && std::env::var_os("GST_PLUGIN_PATH").is_none() {
+        std::env::set_var("GST_PLUGIN_PATH", &plugins);
+        // Keep a system-wide GStreamer install (if any) from shadowing the
+        // bundled plugins with mismatched versions.
+        std::env::set_var("GST_PLUGIN_SYSTEM_PATH", &plugins);
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "windows")]
+    use_bundled_gstreamer();
     profile::migrate_legacy_config_dir();
     corcel_media::init().expect("failed to initialize GStreamer");
 
