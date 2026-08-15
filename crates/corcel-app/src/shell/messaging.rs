@@ -1730,6 +1730,7 @@ impl Shell {
             .flex_1()
             .min_w_0()
             .h_full()
+            .relative()
             .flex()
             .flex_col()
             .child(header)

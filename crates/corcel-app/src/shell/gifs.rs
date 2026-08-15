@@ -210,7 +210,10 @@ impl Shell {
                 .into_any_element()
         };
 
-        div().mx(px(16.)).flex().justify_end().child(
+        // Floats over the chat, anchored to the composer's right corner —
+        // in-flow it occupied a full-width row whose empty left half read
+        // as a giant dead block.
+        div().absolute().bottom(px(76.)).right(px(16.)).child(
             div()
                 .id("gif-picker")
                 .flex()
