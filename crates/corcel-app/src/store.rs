@@ -279,6 +279,17 @@ impl Store {
     /// Every reaction change (removals included — they're tombstones that
     /// must replicate) on a server's messages newer than `since`, for
     /// answering a history request.
+    /// Every distinct author who ever wrote in a server — the closest
+    /// thing to a member roster a serverless server has (there is no
+    /// registry; you're "a member" because your messages are here).
+    pub fn authors(&self, server_id: Uuid) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT author FROM messages WHERE server_id = ?1 ORDER BY author COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![server_id.to_string()], |row| row.get(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     pub fn reactions_since(&self, server_id: Uuid, since: i64) -> anyhow::Result<Vec<crate::chat::ReactionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.message_id, m.channel_id, r.emoji, r.author, r.at, r.removed

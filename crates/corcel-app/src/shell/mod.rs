@@ -354,6 +354,13 @@ pub(crate) struct Shell {
     /// Replicated peer bios, by author name. Memory-only — cheap to
     /// re-receive with the next `ChatPayload::Profile`, unlike avatars.
     peer_bios: HashMap<String, String>,
+    /// Who's online in each server's room: `(server, room peer) → display
+    /// name`, learned from their `ChatPayload::Profile` (everyone sends one
+    /// on entry and to each later arrival). Keyed by peer id so `PeerLeft`
+    /// can sweep an entry without knowing the name — the same crash-safety
+    /// scheme as [`Self::voice_occupants`]. Drives the member panel's
+    /// online section.
+    room_members: HashMap<(Uuid, PeerId), String>,
     /// Whether the edit-profile modal (the onboarding identity card,
     /// reopened) is up.
     edit_profile_open: bool,
@@ -432,6 +439,7 @@ impl Shell {
             voice_occupants: HashMap::new(),
             peer_avatars: profile::load_peer_avatars(),
             peer_bios: HashMap::new(),
+            room_members: HashMap::new(),
             edit_profile_open: false,
             encoded_avatar: None,
             replying_to: None,

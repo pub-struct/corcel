@@ -269,6 +269,10 @@ impl Shell {
                 // by reacting to our PeerJoined (below); we re-announce our
                 // own presence in case we reconnected mid-call.
                 self.clear_voice_occupants(server_id);
+                // Same reset for the member panel's online list: its peer
+                // ids are from the previous connection too. It repopulates
+                // as everyone's Profile cards arrive.
+                self.room_members.retain(|(sid, _), _| *sid != server_id);
                 if let Some(payload) = self.my_voice_presence(server_id) {
                     self.send_room(server_id, payload, None);
                 }
@@ -303,9 +307,10 @@ impl Shell {
             // the crash-safety sweep for members who never said
             // `present: false`.
             ServerMessage::PeerLeft { peer } => {
-                let before = self.voice_occupants.len();
+                let before = self.voice_occupants.len() + self.room_members.len();
                 self.voice_occupants.retain(|(_, occupant), _| *occupant != peer);
-                if self.voice_occupants.len() != before {
+                self.room_members.remove(&(server_id, peer));
+                if self.voice_occupants.len() + self.room_members.len() != before {
                     cx.notify();
                 }
             }
@@ -325,7 +330,7 @@ impl Shell {
                 Ok(ChatPayload::VoicePresence { channel, author, present }) => {
                     self.note_voice_presence(channel, from, author, present, cx);
                 }
-                Ok(ChatPayload::Profile { author, avatar, bio }) => self.absorb_profile(author, avatar, bio, cx),
+                Ok(ChatPayload::Profile { author, avatar, bio }) => self.absorb_profile(server_id, from, author, avatar, bio, cx),
                 _ => {}
             },
             ServerMessage::Direct { from, payload } => match serde_json::from_value(payload) {
@@ -350,7 +355,7 @@ impl Shell {
                 }
                 // The direct copy of a member's profile card, sent to us
                 // when we entered a room they were already in.
-                Ok(ChatPayload::Profile { author, avatar, bio }) => self.absorb_profile(author, avatar, bio, cx),
+                Ok(ChatPayload::Profile { author, avatar, bio }) => self.absorb_profile(server_id, from, author, avatar, bio, cx),
                 // Everything else (Typing, Edit, …) is broadcast-only; a
                 // direct one is a peer bug, and unparseable JSON is a newer
                 // build's payload — both dropped.
@@ -409,6 +414,8 @@ impl Shell {
     /// drops any cached one — that's how photo removal propagates.
     pub(super) fn absorb_profile(
         &mut self,
+        server_id: Uuid,
+        from: PeerId,
         author: String,
         avatar: Option<String>,
         bio: Option<String>,
@@ -417,6 +424,10 @@ impl Shell {
         if author == self.my_name() {
             return;
         }
+        // Their card doubles as "I'm online": every member announces it on
+        // room entry and directly to each later arrival, so it reaches us
+        // exactly once per session of theirs overlapping ours.
+        self.room_members.insert((server_id, from), author.clone());
         match bio {
             Some(bio) => drop(self.peer_bios.insert(author.clone(), bio)),
             None => drop(self.peer_bios.remove(&author)),
@@ -1301,7 +1312,7 @@ impl Shell {
             }))
             .child(self.message_input.clone());
 
-        div()
+        let chat_column = div()
             .flex_1()
             .min_w_0()
             .h_full()
@@ -1311,7 +1322,132 @@ impl Shell {
             .child(scrollback)
             .child(typing_strip)
             .children(reply_bar)
-            .child(composer)
+            .child(composer);
+
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .child(chat_column)
+            .child(self.render_member_panel(profile, cx))
+    }
+
+    /// The member panel on a text channel's right edge. A serverless
+    /// server has no member registry, so "members" is what this machine
+    /// can actually vouch for: everyone whose Profile card arrived over
+    /// the live room is Online; everyone else who has ever written a
+    /// stored message shows under Offline. Bios (when replicated) ride
+    /// along as tooltips.
+    fn render_member_panel(&mut self, profile: &Profile, cx: &mut Context<Self>) -> Div {
+        let Screen::Server { id: server_id, .. } = self.screen else { return div() };
+
+        let mut online: Vec<String> = self
+            .room_members
+            .iter()
+            .filter(|((sid, _), _)| *sid == server_id)
+            .map(|(_, name)| name.clone())
+            .collect();
+        // We count as online whenever our own room connection is up.
+        if self.rooms.contains_key(&server_id) {
+            online.push(profile.name.clone());
+        }
+        online.sort_by_key(|name| name.to_lowercase());
+        online.dedup();
+
+        let mut offline: Vec<String> = self
+            .store
+            .as_ref()
+            .and_then(|store| store.authors(server_id).ok())
+            .unwrap_or_default();
+        offline.retain(|name| !online.contains(name));
+
+        let section_header = |label: String| {
+            div()
+                .px(px(10.))
+                .pt(px(14.))
+                .pb(px(4.))
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::muted_foreground())
+                .child(label)
+        };
+        let mut row_index = 0u64;
+        let mut member_row = |name: String, is_online: bool, shell: &Self| {
+            let is_self = name == profile.name;
+            let avatar = if is_self {
+                profile.avatar_path.clone()
+            } else {
+                shell.peer_avatars.get(&name).cloned()
+            };
+            let initial = name
+                .trim()
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let bio = if is_self {
+                profile.bio.clone()
+            } else {
+                shell.peer_bios.get(&name).cloned()
+            };
+            row_index += 1;
+            let row = div()
+                .id(SharedString::from(format!("member-{row_index}")))
+                .mx(px(6.))
+                .px(px(6.))
+                .py(px(3.))
+                .rounded_md()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .hover(|style| style.bg(theme::wash()))
+                .child(
+                    div()
+                        .flex_none()
+                        .when(!is_online, |avatar| avatar.opacity(0.45))
+                        .child(theme::avatar(avatar, initial, px(26.))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(13.))
+                        .text_color(if is_online { theme::foreground() } else { theme::faint_foreground() })
+                        .child(name),
+                );
+            match bio.filter(|bio| !bio.is_empty()) {
+                Some(bio) => row.tooltip(theme::tooltip(bio)),
+                None => row,
+            }
+        };
+
+        let online_rows: Vec<_> = online.iter().map(|name| member_row(name.clone(), true, self)).collect();
+        let offline_rows: Vec<_> = offline.iter().map(|name| member_row(name.clone(), false, self)).collect();
+
+        div()
+            .w(px(196.))
+            .h_full()
+            .flex_none()
+            .border_l_1()
+            .border_color(theme::border())
+            .bg(theme::card())
+            .child(
+                div()
+                    .id("member-panel-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .pb(px(12.))
+                    .child(section_header(format!("Online — {}", online.len())))
+                    .children(online_rows)
+                    .children((!offline.is_empty()).then(|| section_header(format!("Offline — {}", offline.len()))))
+                    .children(offline_rows),
+            )
     }
 
 }
