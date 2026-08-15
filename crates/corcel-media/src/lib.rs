@@ -14,9 +14,11 @@ mod rtp;
 
 pub mod capture;
 pub mod playback;
+pub mod player;
 
 pub use capture::Capture;
 pub use playback::{AudioPlayback, VideoFrame, VideoPlayback};
+pub use player::{PlayerEvent, UrlPlayer};
 
 /// Initializes GStreamer. Must be called once before any pipeline is built;
 /// safe to call more than once.

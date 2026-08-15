@@ -1,17 +1,23 @@
-//! Display-side rendering of the tiny inline-markdown subset chat supports:
-//! `**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, fenced ``` blocks,
-//! bare URLs, and `@mentions`. Hand-rolled on purpose — the subset is small
-//! enough that owning the edge cases (an unclosed marker renders literally,
-//! nothing nests) beats pulling in a markdown crate whose flavor we'd fight.
+//! Display-side rendering of the markdown subset chat supports. Inline:
+//! `**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, bare URLs,
+//! `[label](url)` links, and `@mentions`. Block-level: fenced ``` code
+//! blocks, `> ` quotes, and `#`/`##`/`###` headings. Hand-rolled on purpose
+//! — the subset is small enough that owning the edge cases (an unclosed
+//! marker renders literally, nothing nests) beats pulling in a markdown
+//! crate whose flavor we'd fight.
 //!
 //! Messages travel and persist as the raw text the author typed; parsing
 //! happens per render. The composer knows nothing about any of this.
+//!
+//! Links do double duty: every URL span is clickable (opens in the system
+//! browser), and [`media_links`] surfaces the ones that point at an image or
+//! video file so the chat panel can render inline embeds under the message.
 
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, StyledText, UnderlineStyle, div,
-    prelude::*, px,
+    AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, InteractiveText, SharedString, StrikethroughStyle,
+    StyledText, UnderlineStyle, div, prelude::*, px,
 };
 
 use crate::theme;
@@ -28,14 +34,104 @@ enum SpanKind {
     Mention,
 }
 
-/// One run of display text (markers already stripped) and its style.
+/// One run of display text (markers already stripped) and its style. `link`
+/// is the click target for URL spans — the span text itself for a bare URL,
+/// the parenthesized target for a `[label](url)` link.
 #[derive(Debug, Clone)]
 struct Span {
     text: String,
     kind: SpanKind,
+    link: Option<String>,
 }
 
-/// Parses a message body into display spans. Single left-to-right pass; a
+/// One block-level run of a message body, produced by [`blocks`].
+enum Block {
+    /// Regular text, inline-styled by [`parse`].
+    Paragraph(String),
+    /// `# ` / `## ` / `### ` heading and its level (1–3).
+    Heading(usize, String),
+    /// Consecutive `> ` lines, markers stripped, joined back with newlines.
+    Quote(String),
+    /// A fenced ``` block's inner text, opening-line language tag dropped
+    /// (Discord-style). No inline parsing happens inside.
+    Code(String),
+}
+
+/// Splits a message body into block-level runs, line by line. A fence left
+/// unclosed swallows the rest of the message as code — the author clearly
+/// meant a code block, and rendering the fence chars literally helps nobody.
+fn blocks(body: &str) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut paragraph: Vec<&str> = Vec::new();
+    let mut quote: Vec<&str> = Vec::new();
+    let mut code: Option<Vec<&str>> = None;
+
+    fn flush(lines: &mut Vec<&str>, blocks: &mut Vec<Block>, build: fn(String) -> Block) {
+        if !lines.is_empty() {
+            blocks.push(build(lines.join("\n")));
+            lines.clear();
+        }
+    }
+
+    for line in body.lines() {
+        if let Some(code_lines) = &mut code {
+            if line.trim() == "```" {
+                blocks.push(Block::Code(code_lines.join("\n")));
+                code = None;
+            } else {
+                code_lines.push(line);
+            }
+            continue;
+        }
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            flush(&mut quote, &mut blocks, Block::Quote);
+            flush(&mut paragraph, &mut blocks, Block::Paragraph);
+            // ```code``` on one line closes immediately; otherwise the rest
+            // of the opening line is a language tag, dropped.
+            match rest.strip_suffix("```").filter(|inner| !inner.is_empty()) {
+                Some(inner) => blocks.push(Block::Code(inner.to_string())),
+                None => code = Some(Vec::new()),
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("> ").or_else(|| line.strip_prefix('>')) {
+            flush(&mut paragraph, &mut blocks, Block::Paragraph);
+            quote.push(rest);
+            continue;
+        }
+        flush(&mut quote, &mut blocks, Block::Quote);
+        if let Some((level, text)) = heading(line) {
+            flush(&mut paragraph, &mut blocks, Block::Paragraph);
+            blocks.push(Block::Heading(level, text.to_string()));
+            continue;
+        }
+        if line.trim().is_empty() {
+            flush(&mut paragraph, &mut blocks, Block::Paragraph);
+            continue;
+        }
+        paragraph.push(line);
+    }
+    if let Some(code_lines) = code {
+        blocks.push(Block::Code(code_lines.join("\n")));
+    }
+    flush(&mut quote, &mut blocks, Block::Quote);
+    flush(&mut paragraph, &mut blocks, Block::Paragraph);
+    blocks
+}
+
+/// `# `/`## `/`### ` at the start of a line, with non-empty text after it.
+fn heading(line: &str) -> Option<(usize, &str)> {
+    for (marker, level) in [("### ", 3), ("## ", 2), ("# ", 1)] {
+        if let Some(text) = line.strip_prefix(marker) {
+            if !text.trim().is_empty() {
+                return Some((level, text));
+            }
+        }
+    }
+    None
+}
+
+/// Parses one block's text into display spans. Single left-to-right pass; a
 /// marker only takes effect if its closing pair exists with something
 /// between them, otherwise the character is literal text. Styles don't nest.
 fn parse(body: &str) -> Vec<Span> {
@@ -46,7 +142,7 @@ fn parse(body: &str) -> Vec<Span> {
 
     let flush = |plain: &mut String, spans: &mut Vec<Span>| {
         if !plain.is_empty() {
-            spans.push(Span { text: std::mem::take(plain), kind: SpanKind::Plain });
+            spans.push(Span { text: std::mem::take(plain), kind: SpanKind::Plain, link: None });
         }
     };
 
@@ -79,7 +175,30 @@ fn try_marker(rest: &str, prev: Option<char>) -> Option<(usize, Span)> {
             if let Some(end) = inner_and_beyond.find(marker) {
                 if end > 0 {
                     let inner = &inner_and_beyond[..end];
-                    return Some((marker.len() * 2 + end, Span { text: inner.to_string(), kind }));
+                    return Some((
+                        marker.len() * 2 + end,
+                        Span { text: inner.to_string(), kind, link: None },
+                    ));
+                }
+            }
+        }
+    }
+
+    // `[label](https://...)` — a markdown link. Only http(s) targets count;
+    // anything else renders literally rather than becoming a dead link.
+    if rest.starts_with('[') {
+        if let Some(close) = rest.find("](") {
+            let label = &rest[1..close];
+            if !label.is_empty() && !label.contains('\n') && !label.contains('[') {
+                let after = &rest[close + 2..];
+                if let Some(end) = after.find(')') {
+                    let url = &after[..end];
+                    if is_http_url(url) && !url.contains(char::is_whitespace) {
+                        return Some((
+                            close + 2 + end + 1,
+                            Span { text: label.to_string(), kind: SpanKind::Url, link: Some(url.to_string()) },
+                        ));
+                    }
                 }
             }
         }
@@ -90,7 +209,10 @@ fn try_marker(rest: &str, prev: Option<char>) -> Option<(usize, Span)> {
         let url = &rest[..end];
         // A bare scheme isn't a link worth styling.
         if url.len() > "https://".len() {
-            return Some((end, Span { text: url.to_string(), kind: SpanKind::Url }));
+            return Some((
+                end,
+                Span { text: url.to_string(), kind: SpanKind::Url, link: Some(url.to_string()) },
+            ));
         }
     }
 
@@ -102,50 +224,97 @@ fn try_marker(rest: &str, prev: Option<char>) -> Option<(usize, Span)> {
             .unwrap_or(rest.len() - 1);
         if name_len > 0 {
             let text = &rest[..1 + name_len];
-            return Some((text.len(), Span { text: text.to_string(), kind: SpanKind::Mention }));
+            return Some((text.len(), Span { text: text.to_string(), kind: SpanKind::Mention, link: None }));
         }
     }
 
     None
 }
 
-/// The inner text of a message that is entirely one fenced ``` code block,
-/// or `None` for everything else. An opening-line language tag (```rust) is
-/// dropped, Discord-style.
-fn fenced_code(body: &str) -> Option<String> {
-    let trimmed = body.trim();
-    let inner = trimmed.strip_prefix("```")?.strip_suffix("```")?;
-    if inner.is_empty() {
-        return None;
-    }
-    let inner = match inner.split_once('\n') {
-        Some((first_line, remainder))
-            if !remainder.trim().is_empty()
-                && !first_line.trim().is_empty()
-                && first_line.trim().chars().all(|c| c.is_alphanumeric()) =>
-        {
-            remainder
+fn is_http_url(url: &str) -> bool {
+    (url.starts_with("http://") || url.starts_with("https://")) && url.len() > "https://".len()
+}
+
+/// What kind of inline embed a media URL should get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+/// A URL in a message body that points at a media file (see [`media_links`]).
+pub struct MediaLink {
+    pub url: String,
+    pub kind: MediaKind,
+}
+
+/// Every URL in `body` that looks like an image or video file, in order of
+/// appearance, deduplicated. Code blocks don't count — a URL inside a code
+/// sample wasn't shared to be looked at.
+pub fn media_links(body: &str) -> Vec<MediaLink> {
+    let mut links: Vec<MediaLink> = Vec::new();
+    for block in blocks(body) {
+        let text = match block {
+            Block::Code(_) => continue,
+            Block::Paragraph(text) | Block::Quote(text) | Block::Heading(_, text) => text,
+        };
+        for span in parse(&text) {
+            let Some(url) = span.link else { continue };
+            let Some(kind) = classify_media(&url) else { continue };
+            if !links.iter().any(|link| link.url == url) {
+                links.push(MediaLink { url, kind });
+            }
         }
-        _ => inner,
-    };
-    Some(inner.trim_matches('\n').to_string())
+    }
+    links
+}
+
+/// Classifies a URL by the file extension of its path (query string and
+/// fragment ignored). `None` for anything that isn't an obvious media file.
+fn classify_media(url: &str) -> Option<MediaKind> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next()?;
+    let (_, ext) = name.rsplit_once('.')?;
+    match ext.to_ascii_lowercase().as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(MediaKind::Image),
+        "mp4" | "webm" | "mov" | "mkv" | "m4v" => Some(MediaKind::Video),
+        _ => None,
+    }
 }
 
 /// Whether `body` `@mention`s this profile name (case-insensitive). This is
 /// the precise check behind the message-row highlight; the store's badge
 /// query uses a coarser `LIKE` and may over-count — the row never lies.
+/// Mentions inside code blocks don't count.
 pub fn mentions_user(body: &str, name: &str) -> bool {
-    parse(body)
-        .iter()
-        .any(|span| span.kind == SpanKind::Mention && span.text[1..].eq_ignore_ascii_case(name))
+    blocks(body).into_iter().any(|block| {
+        let text = match block {
+            Block::Code(_) => return false,
+            Block::Paragraph(text) | Block::Quote(text) | Block::Heading(_, text) => text,
+        };
+        parse(&text)
+            .iter()
+            .any(|span| span.kind == SpanKind::Mention && span.text[1..].eq_ignore_ascii_case(name))
+    })
 }
 
-/// Renders a message body: a mono card for a fenced code block, styled
-/// inline text for everything else. Inherits text color/size from the
-/// surrounding element for plain runs.
-pub fn render_body(body: &str) -> AnyElement {
-    if let Some(code) = fenced_code(body) {
-        return div()
+/// Renders a message body as its block-level runs stacked vertically. `seed`
+/// makes the clickable-link element ids unique per message — pass something
+/// stable for the message (its id), so GPUI's element state tracks across
+/// re-renders.
+pub fn render_body(seed: u64, body: &str) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .text_size(px(14.))
+        .children(blocks(body).into_iter().enumerate().map(|(ix, block)| render_block(seed, ix, block)))
+        .into_any_element()
+}
+
+fn render_block(seed: u64, ix: usize, block: Block) -> AnyElement {
+    match block {
+        Block::Code(code) => div()
             .my(px(2.))
             .px(px(10.))
             .py(px(8.))
@@ -156,12 +325,40 @@ pub fn render_body(body: &str) -> AnyElement {
             .font_family("monospace")
             .text_size(px(13.))
             .child(code)
-            .into_any_element();
+            .into_any_element(),
+        Block::Quote(text) => div()
+            .pl(px(10.))
+            .border_l_2()
+            .border_color(theme::wash_strong())
+            .text_color(theme::muted_foreground())
+            .child(inline_text(seed, ix, &text))
+            .into_any_element(),
+        Block::Heading(level, text) => {
+            let size = match level {
+                1 => 20.,
+                2 => 17.,
+                _ => 15.,
+            };
+            div()
+                .mt(px(4.))
+                .text_size(px(size))
+                .font_weight(FontWeight::BOLD)
+                .child(inline_text(seed, ix, &text))
+                .into_any_element()
+        }
+        Block::Paragraph(text) => div().child(inline_text(seed, ix, &text)).into_any_element(),
     }
+}
 
-    let spans = parse(body);
+/// One block's inline-styled text. Plain styled text when there's nothing to
+/// click; wrapped in an [`InteractiveText`] when the block contains links,
+/// so clicking a link's range opens it in the system browser.
+fn inline_text(seed: u64, block_ix: usize, source: &str) -> AnyElement {
+    let spans = parse(source);
     let mut text = String::new();
     let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut link_ranges: Vec<Range<usize>> = Vec::new();
+    let mut link_urls: Vec<String> = Vec::new();
     for span in &spans {
         let start = text.len();
         text.push_str(&span.text);
@@ -200,7 +397,72 @@ pub fn render_body(body: &str) -> AnyElement {
         if let Some(style) = style {
             highlights.push((start..text.len(), style));
         }
+        if let Some(url) = &span.link {
+            link_ranges.push(start..text.len());
+            link_urls.push(url.clone());
+        }
     }
 
-    div().text_size(px(14.)).child(StyledText::new(text).with_highlights(highlights)).into_any_element()
+    let styled = StyledText::new(text).with_highlights(highlights);
+    if link_urls.is_empty() {
+        return styled.into_any_element();
+    }
+    let id: ElementId = SharedString::from(format!("richtext-{seed:x}-{block_ix}")).into();
+    InteractiveText::new(id, styled)
+        .on_click(link_ranges, move |range_ix, _window, cx| {
+            if let Some(url) = link_urls.get(range_ix) {
+                cx.open_url(url);
+            }
+        })
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_split_paragraphs_code_quotes_headings() {
+        let body = "# Title\nplain text\n> quoted\n> more\n```rust\nlet x = 1;\n```\ntail";
+        let blocks = blocks(body);
+        assert_eq!(blocks.len(), 5);
+        assert!(matches!(&blocks[0], Block::Heading(1, text) if text == "Title"));
+        assert!(matches!(&blocks[1], Block::Paragraph(text) if text == "plain text"));
+        assert!(matches!(&blocks[2], Block::Quote(text) if text == "quoted\nmore"));
+        assert!(matches!(&blocks[3], Block::Code(text) if text == "let x = 1;"));
+        assert!(matches!(&blocks[4], Block::Paragraph(text) if text == "tail"));
+    }
+
+    #[test]
+    fn unclosed_fence_swallows_the_rest_as_code() {
+        let blocks = blocks("```\nno closing fence");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], Block::Code(text) if text == "no closing fence"));
+    }
+
+    #[test]
+    fn markdown_link_parses_label_and_target() {
+        let spans = parse("see [the docs](https://example.com/x) ok");
+        let link = spans.iter().find(|span| span.kind == SpanKind::Url).expect("a link span");
+        assert_eq!(link.text, "the docs");
+        assert_eq!(link.link.as_deref(), Some("https://example.com/x"));
+    }
+
+    #[test]
+    fn media_links_classify_and_skip_code() {
+        let body = "look https://a.io/cat.png and [clip](https://a.io/clip.mp4?t=1)\n```\nhttps://a.io/ignored.png\n```";
+        let links = media_links(body);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].url, "https://a.io/cat.png");
+        assert_eq!(links[0].kind, MediaKind::Image);
+        assert_eq!(links[1].url, "https://a.io/clip.mp4?t=1");
+        assert_eq!(links[1].kind, MediaKind::Video);
+    }
+
+    #[test]
+    fn mentions_ignore_code_and_match_case_insensitively() {
+        assert!(mentions_user("hey @Sam look", "sam"));
+        assert!(!mentions_user("mail me at sam@example.com", "sam"));
+        assert!(!mentions_user("```\n@sam\n```", "sam"));
+    }
 }

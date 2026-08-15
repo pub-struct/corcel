@@ -28,3 +28,7 @@ image = "0.25.1"
 rusqlite = { version = "0.38", features = ["bundled"] }
 # Only for rendering message timestamps in the user's local timezone.
 chrono = "0.4"
+# Fetching linked images for inline chat embeds. Blocking on purpose — each
+# fetch runs on tokio's blocking pool (see shell::embeds), and a synchronous
+# client keeps reqwest's async machinery out of the tree.
+ureq = "2"

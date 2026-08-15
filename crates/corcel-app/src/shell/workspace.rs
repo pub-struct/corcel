@@ -48,6 +48,7 @@ impl Shell {
         self.rooms.remove(&id);
         self.chat_messages.clear();
         self.reset_composer_state();
+        self.stop_video_embeds(cx);
         if let Some(store) = &self.store {
             let _ = store.remove_server(id);
         }

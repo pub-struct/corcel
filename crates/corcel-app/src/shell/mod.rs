@@ -7,6 +7,7 @@
 //! constructor, navigation, and the root render + app-wide key handling.
 
 mod call;
+mod embeds;
 mod messaging;
 mod onboarding;
 mod switcher;
@@ -40,6 +41,7 @@ use crate::theme::{self, ButtonVariant};
 use crate::{richtext, runtime};
 
 use call::{speaking_avatar, stage_tile};
+use embeds::{ImageEmbed, VideoEmbed};
 
 /// How long a remote peer's speaking ring survives without a fresh
 /// `Speaking { true }`. Transitions are explicit (unlike typing, silence
@@ -355,6 +357,12 @@ pub(crate) struct Shell {
     /// Rebuilt from the store whenever the channel (re)loads or a reaction
     /// lands (see [`Shell::reload_reactions`]).
     chat_reactions: HashMap<Uuid, Vec<(String, Vec<String>)>>,
+    /// Fetched/decoded images for chat embeds, by URL, kept for the app's
+    /// lifetime (see [`embeds`]).
+    image_embeds: HashMap<String, ImageEmbed>,
+    /// Video embeds the user pressed play on, by URL. Torn down on any
+    /// navigation via [`Shell::stop_video_embeds`].
+    video_embeds: HashMap<String, VideoEmbed>,
     add_server_open: bool,
     /// Where the add-server flow currently stands (see [`AddServerStage`]).
     /// Reset to `Choice` whenever the flow is (re)entered.
@@ -403,6 +411,8 @@ impl Shell {
             editing: None,
             reacting_to: None,
             chat_reactions: HashMap::new(),
+            image_embeds: HashMap::new(),
+            video_embeds: HashMap::new(),
             add_server_open: false,
             add_server_stage: AddServerStage::Choice,
             hosting_pending: false,
@@ -508,6 +518,7 @@ impl Shell {
         self.screen = Screen::Server { id, view: ServerView::Lobby };
         self.chat_messages.clear();
         self.reset_composer_state();
+        self.stop_video_embeds(cx);
         self.error = None;
         cx.notify();
     }

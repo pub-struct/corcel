@@ -21,8 +21,10 @@ pub mod icons {
     pub const MIC: &str = "icons/mic.svg";
     pub const MIC_OFF: &str = "icons/mic-off.svg";
     pub const MONITOR_UP: &str = "icons/monitor-up.svg";
+    pub const PAUSE: &str = "icons/pause.svg";
     pub const PENCIL: &str = "icons/pencil.svg";
     pub const PHONE: &str = "icons/phone.svg";
+    pub const PLAY: &str = "icons/play.svg";
     pub const PLUS: &str = "icons/plus.svg";
     pub const REPLY: &str = "icons/reply.svg";
     pub const SMILE_PLUS: &str = "icons/smile-plus.svg";
@@ -44,8 +46,10 @@ const ASSETS: &[(&str, &[u8])] = &[
     (icons::MIC, include_bytes!("../assets/icons/mic.svg")),
     (icons::MIC_OFF, include_bytes!("../assets/icons/mic-off.svg")),
     (icons::MONITOR_UP, include_bytes!("../assets/icons/monitor-up.svg")),
+    (icons::PAUSE, include_bytes!("../assets/icons/pause.svg")),
     (icons::PENCIL, include_bytes!("../assets/icons/pencil.svg")),
     (icons::PHONE, include_bytes!("../assets/icons/phone.svg")),
+    (icons::PLAY, include_bytes!("../assets/icons/play.svg")),
     (icons::PLUS, include_bytes!("../assets/icons/plus.svg")),
     (icons::REPLY, include_bytes!("../assets/icons/reply.svg")),
     (icons::SMILE_PLUS, include_bytes!("../assets/icons/smile-plus.svg")),

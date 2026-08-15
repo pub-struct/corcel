@@ -17,6 +17,7 @@ impl Shell {
         self.chat_messages =
             self.store.as_ref().and_then(|store| store.messages(channel.id).ok()).unwrap_or_default();
         self.reset_composer_state();
+        self.stop_video_embeds(cx);
         self.reload_reactions(channel.id);
         self.mark_channel_read(channel.id);
         self.screen = Screen::Server { id, view: ServerView::Text { channel } };
@@ -627,6 +628,18 @@ impl Shell {
                 (message.id, (message.author.clone(), snippet))
             })
             .collect();
+        // Embed elements are built before the row loop: building them can
+        // kick off image fetches and needs `&mut self`, which the row
+        // closure can't have while it borrows the message list.
+        let mut embeds: HashMap<Uuid, Vec<gpui::AnyElement>> = {
+            let bodies: Vec<(Uuid, String)> = self
+                .chat_messages
+                .iter()
+                .filter(|message| !message.deleted)
+                .map(|message| (message.id, message.body.clone()))
+                .collect();
+            bodies.into_iter().map(|(id, body)| (id, self.render_message_embeds(&body, cx))).collect()
+        };
         let message_rows = self
             .chat_messages
             .iter()
@@ -702,7 +715,7 @@ impl Shell {
                         )
                         .into_any_element()
                 } else {
-                    richtext::render_body(&message.body)
+                    richtext::render_body(message.id.as_u128() as u64, &message.body)
                 };
 
                 // Reaction chips: emoji + count, outlined in blurple when
@@ -885,6 +898,7 @@ impl Shell {
                                     }),
                             )
                             .child(body)
+                            .children(embeds.remove(&message.id).unwrap_or_default())
                             .children(chips)
                             .children(palette),
                     )
