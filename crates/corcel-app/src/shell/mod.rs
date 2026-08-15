@@ -434,6 +434,10 @@ pub(crate) struct Shell {
     thread_counts: HashMap<Uuid, (u32, i64)>,
     /// The thread panel's composer.
     thread_input: Entity<TextInput>,
+    /// Which row of the composer's @mention autocomplete is highlighted.
+    /// Clamped against the current candidate list at use; the popup itself
+    /// is derived state (an `@word` under the caret with matches).
+    mention_selected: usize,
     /// Live reactions of the on-screen text channel: message → chips in
     /// first-reacted order, each an emoji with everyone who reacted with it.
     /// Rebuilt from the store whenever the channel (re)loads or a reaction
@@ -505,6 +509,7 @@ impl Shell {
             thread_messages: Vec::new(),
             thread_counts: HashMap::new(),
             thread_input: cx.new(|cx| TextInput::new("Reply in thread…", cx)),
+            mention_selected: 0,
             reacting_to: None,
             chat_reactions: HashMap::new(),
             image_embeds: HashMap::new(),

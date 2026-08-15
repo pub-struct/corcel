@@ -287,14 +287,30 @@ fn classify_media(url: &str) -> Option<MediaKind> {
 /// query uses a coarser `LIKE` and may over-count — the row never lies.
 /// Mentions inside code blocks don't count.
 pub fn mentions_user(body: &str, name: &str) -> bool {
+    // Raw-text search rather than span comparison: the mention *span* only
+    // colors up to the first non-word character, but display names can
+    // contain spaces ("zé do caixão") — those must still count as
+    // mentioned when the full name follows the `@`.
+    let needle = format!("@{}", name.to_lowercase());
     blocks(body).into_iter().any(|block| {
         let text = match block {
             Block::Code(_) => return false,
             Block::Paragraph(text) | Block::Quote(text) | Block::Heading(_, text) => text,
         };
-        parse(&text)
-            .iter()
-            .any(|span| span.kind == SpanKind::Mention && span.text[1..].eq_ignore_ascii_case(name))
+        let haystack = text.to_lowercase();
+        let mut from = 0;
+        while let Some(at) = haystack[from..].find(&needle).map(|ix| from + ix) {
+            let before_ok = haystack[..at].chars().last().is_none_or(|c| !c.is_alphanumeric());
+            let after_ok = haystack[at + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'));
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
     })
 }
 
@@ -511,6 +527,13 @@ mod tests {
         // URLs without an embed are untouched.
         let spans = visible_spans("https://a.io/dog.gif", &[]);
         assert_eq!(spans[0].text, "https://a.io/dog.gif");
+    }
+
+    #[test]
+    fn mentions_match_multi_word_names() {
+        assert!(mentions_user("oi @zé do caixão beleza?", "Zé do Caixão"));
+        assert!(!mentions_user("oi @zé beleza?", "zé do caixão"));
+        assert!(!mentions_user("ping @samuel", "sam"));
     }
 
     #[test]

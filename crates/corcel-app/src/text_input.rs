@@ -197,6 +197,12 @@ impl TextInput {
         cx.notify()
     }
 
+    /// The caret's byte offset into [`Self::content`] — lets the composer's
+    /// mention autocomplete find the `@word` being typed.
+    pub fn cursor(&self) -> usize {
+        self.cursor_offset()
+    }
+
     fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start

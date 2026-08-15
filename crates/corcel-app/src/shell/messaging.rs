@@ -783,6 +783,69 @@ impl Shell {
         cx.notify();
     }
 
+    /// The `@word` currently being typed under the composer's caret, as
+    /// `(byte offset of the '@', query so far)` — the trigger for the
+    /// mention autocomplete. The `@` must start a word, and the query runs
+    /// caret-backwards to it with no whitespace in between.
+    pub(super) fn active_mention(&self, cx: &Context<Self>) -> Option<(usize, String)> {
+        let input = self.message_input.read(cx);
+        let content = input.content.to_string();
+        let head = content.get(..input.cursor())?;
+        let at = head.rfind('@')?;
+        if head[..at].chars().last().is_some_and(|c| c.is_alphanumeric()) {
+            return None;
+        }
+        let query = &head[at + 1..];
+        if query.contains(char::is_whitespace) {
+            return None;
+        }
+        Some((at, query.to_string()))
+    }
+
+    /// Everyone this server knows who matches `query` (case-insensitive
+    /// prefix): online room members first, then everyone who ever wrote a
+    /// stored message. Capped so the popup stays a popup.
+    pub(super) fn mention_candidates(&self, server_id: Uuid, query: &str) -> Vec<String> {
+        let query = query.to_lowercase();
+        let mut names: Vec<String> = self
+            .room_members
+            .iter()
+            .filter(|((sid, _), _)| *sid == server_id)
+            .map(|(_, name)| name.clone())
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        names.dedup();
+        let offline = self
+            .store
+            .as_ref()
+            .and_then(|store| store.authors(server_id).ok())
+            .unwrap_or_default();
+        for name in offline {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        let me = self.my_name();
+        names.retain(|name| *name != me && name.to_lowercase().starts_with(&query));
+        names.truncate(8);
+        names
+    }
+
+    /// Replaces the `@query` being typed with `@name ` and refocuses the
+    /// caret (at the end — fine in practice, mentions are typed at the
+    /// tail of a draft).
+    pub(super) fn complete_mention(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some((at, _)) = self.active_mention(cx) else { return };
+        let (content, cursor) = {
+            let input = self.message_input.read(cx);
+            (input.content.to_string(), input.cursor())
+        };
+        let completed = format!("{}@{} {}", &content[..at], name, &content[cursor..]);
+        self.message_input.update(cx, |input, cx| input.set_content(completed, cx));
+        self.mention_selected = 0;
+        cx.notify();
+    }
+
     /// The server and channel of the text view on screen — every message
     /// action below is only reachable from there.
     pub(super) fn visible_text_channel(&self) -> Option<(Uuid, Uuid)> {
@@ -1438,13 +1501,107 @@ impl Shell {
                 )
         });
 
+        // The @mention autocomplete, floating as a card just above the
+        // composer whenever an `@word` is under the caret and someone
+        // matches it. ↑/↓ move, Enter/Tab complete, a click completes too.
+        let mention_popup = self
+            .visible_text_channel()
+            .and_then(|(server_id, _)| {
+                let (_, query) = self.active_mention(cx)?;
+                let candidates = self.mention_candidates(server_id, &query);
+                if candidates.is_empty() {
+                    return None;
+                }
+                let selected = self.mention_selected.min(candidates.len() - 1);
+                let rows: Vec<_> = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        let avatar = self.peer_avatars.get(name).cloned();
+                        let initial = name
+                            .trim()
+                            .chars()
+                            .next()
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        let name_for_click = name.clone();
+                        div()
+                            .id(SharedString::from(format!("mention-{index}")))
+                            .px(px(8.))
+                            .py(px(5.))
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .cursor_pointer()
+                            .when(index == selected, |row| row.bg(theme::wash_strong()))
+                            .hover(|style| style.bg(theme::wash_strong()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _, _window, cx| {
+                                    shell.complete_mention(&name_for_click, cx);
+                                }),
+                            )
+                            .child(theme::avatar(avatar, initial, px(22.)))
+                            .child(div().text_size(px(13.)).child(name.clone()))
+                    })
+                    .collect();
+                Some(
+                    div().mx(px(16.)).flex().child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .p(px(4.))
+                            .mb(px(4.))
+                            .min_w(px(220.))
+                            .rounded_lg()
+                            .bg(theme::popover())
+                            .border_1()
+                            .border_color(theme::border())
+                            .shadow_md()
+                            .children(rows),
+                    ),
+                )
+            });
+
         let composer = div()
             .flex_none()
             .px(px(16.))
             .pb(px(16.))
             .pt(px(2.))
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, _window, cx| {
-                if event.keystroke.key == "enter" {
+                let key = event.keystroke.key.as_str();
+                // While the mention popup is up it owns Enter/Tab/↑/↓;
+                // everything else falls through to the normal composer
+                // behavior (the input itself already handled the edit).
+                if let Some((server_id, _)) = shell.visible_text_channel() {
+                    if let Some((_, query)) = shell.active_mention(cx) {
+                        let candidates = shell.mention_candidates(server_id, &query);
+                        if !candidates.is_empty() {
+                            let selected = shell.mention_selected.min(candidates.len() - 1);
+                            match key {
+                                "enter" | "tab" => {
+                                    let pick = candidates[selected].clone();
+                                    shell.complete_mention(&pick, cx);
+                                    return;
+                                }
+                                "up" => {
+                                    shell.mention_selected = selected.saturating_sub(1);
+                                    cx.notify();
+                                    return;
+                                }
+                                "down" => {
+                                    shell.mention_selected = (selected + 1).min(candidates.len() - 1);
+                                    cx.notify();
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if key == "enter" {
                     shell.send_chat_message(cx);
                 } else {
                     shell.maybe_send_typing(cx);
@@ -1462,6 +1619,7 @@ impl Shell {
             .child(scrollback)
             .child(typing_strip)
             .children(reply_bar)
+            .children(mention_popup)
             .child(composer);
 
         // The thread panel takes the member panel's slot while open —
