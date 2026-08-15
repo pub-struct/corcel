@@ -254,10 +254,19 @@ pub fn icon_button(id: &'static str, icon_path: &'static str, label: impl Into<S
 /// A circular avatar: the picked image if there is one, otherwise a flat
 /// fill showing `fallback_initial`.
 pub fn avatar(path: Option<PathBuf>, fallback_initial: impl Into<SharedString>, size: gpui::Pixels) -> Div {
+    // The rounding lives on the content itself: GPUI's `overflow_hidden`
+    // clips to the rectangle, not the corner radius, so a rounded wrapper
+    // around a square img still painted a square photo.
     let content: gpui::AnyElement = match path {
-        Some(path) => img(ImageSource::from(path)).size_full().object_fit(gpui::ObjectFit::Cover).into_any_element(),
+        Some(path) => img(ImageSource::from(path))
+            .size_full()
+            .rounded_full()
+            .object_fit(gpui::ObjectFit::Cover)
+            .into_any_element(),
         None => div()
             .size_full()
+            .rounded_full()
+            .overflow_hidden()
             .flex()
             .items_center()
             .justify_center()
@@ -268,5 +277,5 @@ pub fn avatar(path: Option<PathBuf>, fallback_initial: impl Into<SharedString>, 
             .into_any_element(),
     };
 
-    div().size(size).rounded_full().overflow_hidden().bg(wash_strong()).child(content)
+    div().size(size).rounded_full().bg(wash_strong()).child(content)
 }

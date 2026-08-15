@@ -253,7 +253,7 @@ impl Shell {
                     MouseButton::Left,
                     cx.listener(move |shell, _, _window, cx| shell.toggle_video_embed(&url, cx)),
                 )
-                .child(div().size_full().child(surface))
+                .child(div().size_full().rounded_lg().overflow_hidden().child(surface))
                 .when(paused, |card| card.child(play_overlay(icons::PLAY)))
                 .into_any_element()
             }
@@ -321,7 +321,7 @@ fn image_card(url: String, image: Arc<RenderImage>, cx: &mut Context<Shell>) -> 
         .border_color(theme::border())
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, cx.listener(move |_shell, _, _window, cx| cx.open_url(&url)))
-        .child(img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Contain).id(id))
+        .child(img(ImageSource::Render(image)).size_full().rounded_lg().object_fit(ObjectFit::Contain).id(id))
         .into_any_element()
 }
 

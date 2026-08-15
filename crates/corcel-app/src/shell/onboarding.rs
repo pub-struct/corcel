@@ -415,12 +415,18 @@ impl Shell {
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "?".to_string());
 
+        // Top corners rounded on the banner itself: the card's
+        // overflow_hidden clips to the rectangle, not the radius (same
+        // GPUI behavior theme::avatar works around).
         let banner: AnyElement = match &self.profile_form.banner_path {
-            Some(path) => {
-                img(ImageSource::from(path.clone())).size_full().object_fit(ObjectFit::Cover).into_any_element()
-            }
+            Some(path) => img(ImageSource::from(path.clone()))
+                .size_full()
+                .rounded_t_xl()
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
             None => div()
                 .size_full()
+                .rounded_t_xl()
                 .bg(linear_gradient(
                     120.,
                     linear_color_stop(rgba(0x5865f2ff), 0.),
@@ -987,7 +993,7 @@ pub(super) fn arrival_choice_card(
         .hover(|style| style.border_color(theme::ring()).bg(theme::wash()))
         .active(|style| style.opacity(0.92))
         .child(
-            div().h(px(112.)).w_full().bg(art).flex().items_center().justify_center().child(
+            div().h(px(112.)).w_full().rounded_t_xl().bg(art).flex().items_center().justify_center().child(
                 div()
                     .size(px(52.))
                     .rounded_full()
