@@ -106,12 +106,15 @@ pub struct AudioPlayback {
 
 impl AudioPlayback {
     /// Decodes straight to the system-default audio sink (PipeWire on
-    /// Linux, CoreAudio on macOS) — there's no caller-facing output here,
-    /// unlike [`VideoPlayback`], since audio has nowhere else useful to go.
+    /// Linux, CoreAudio on macOS, WASAPI on Windows) — there's no
+    /// caller-facing output here, unlike [`VideoPlayback`], since audio has
+    /// nowhere else useful to go.
     pub fn new() -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
         const AUDIO_SINK: &str = "osxaudiosink";
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        const AUDIO_SINK: &str = "wasapi2sink";
+        #[cfg(target_os = "linux")]
         const AUDIO_SINK: &str = "pipewiresink";
         let description = format!(
             "appsrc name=src is-live=true format=time do-timestamp=true \

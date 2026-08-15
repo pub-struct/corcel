@@ -30,13 +30,26 @@ jobs:
       - name: Install GStreamer (MSVC) + pkg-config
         run: choco install -y --no-progress gstreamer gstreamer-devel pkgconfiglite
 
+      # The MSI writes GSTREAMER_1_0_ROOT_MSVC_X86_64 as a *machine* env var,
+      # which this already-running job never inherits — resolve it from the
+      # registry, with a filesystem search as fallback, and dump what's on
+      # disk if neither finds it so the failure is diagnosable from the log.
       - name: Expose GStreamer to cargo
         shell: pwsh
         run: |
-          $root = 'C:\gstreamer\1.0\msvc_x86_64'
-          if (-not (Test-Path "$root\lib\pkgconfig")) {
-            Write-Error "GStreamer dev package not found at $root"
+          $root = [Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64', 'Machine')
+          if (-not $root -or -not (Test-Path "$root\lib\pkgconfig")) {
+            $candidate = Get-ChildItem 'C:\gstreamer\1.0' -Directory -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path "$($_.FullName)\lib\pkgconfig" } |
+              Select-Object -First 1
+            $root = $candidate?.FullName
           }
+          if (-not $root) {
+            Get-ChildItem C:\gstreamer -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            Write-Error 'no GStreamer dev install with lib\pkgconfig found'
+          }
+          Write-Host "GStreamer root: $root"
           Add-Content $env:GITHUB_ENV "PKG_CONFIG_PATH=$root\lib\pkgconfig"
           Add-Content $env:GITHUB_PATH "$root\bin"
 

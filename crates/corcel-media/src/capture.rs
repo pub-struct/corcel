@@ -125,15 +125,21 @@ fn pump_packets(label: &'static str, sink: AppSink) -> mpsc::Receiver<rtc::rtp::
 }
 
 /// Captures from a camera: a V4L2 device (e.g. `/dev/video0`) on Linux, or
-/// the system default camera via AVFoundation on macOS (where `device` is
-/// ignored — the concept of a device *path* doesn't exist there).
+/// the system default camera via AVFoundation on macOS / Media Foundation
+/// on Windows (where `device` is ignored — the concept of a device *path*
+/// doesn't exist there).
 pub fn camera(device: &str) -> anyhow::Result<Capture> {
     #[cfg(target_os = "macos")]
     let source = {
         let _ = device;
         "avfvideosrc".to_string()
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let source = {
+        let _ = device;
+        "mfvideosrc".to_string()
+    };
+    #[cfg(target_os = "linux")]
     let source = format!("v4l2src device=\"{device}\"");
     let description = format!(
         "{source} ! {postproc} \
@@ -162,11 +168,13 @@ const SPEAKING_HANGOVER: std::time::Duration = std::time::Duration::from_millis(
 /// encoder by GStreamer's `level` element — so it keeps reporting while
 /// the app-level mute merely discards the encoded packets downstream.
 pub fn microphone() -> anyhow::Result<(Capture, watch::Receiver<bool>)> {
-    // CoreAudio's source element on macOS, PipeWire elsewhere — both grab
-    // the system-default input device.
+    // CoreAudio's source element on macOS, WASAPI on Windows, PipeWire on
+    // Linux — all grab the system-default input device.
     #[cfg(target_os = "macos")]
     const AUDIO_SOURCE: &str = "osxaudiosrc";
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    const AUDIO_SOURCE: &str = "wasapi2src";
+    #[cfg(target_os = "linux")]
     const AUDIO_SOURCE: &str = "pipewiresrc";
     let description = format!(
         "{AUDIO_SOURCE} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
@@ -266,6 +274,26 @@ fn watch_microphone_bus(gst_pipeline: &gstreamer::Pipeline) -> watch::Receiver<b
 pub async fn screen() -> anyhow::Result<Capture> {
     let description = format!(
         "avfvideosrc capture-screen=true capture-screen-cursor=true ! video/x-raw \
+         ! {postproc} ! video/x-raw ! {encoder} \
+         ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
+         ! appsink name=sink emit-signals=false sync=false",
+        postproc = codec::video_postproc()?,
+        encoder = codec::h264_encoder()?,
+        pt = corcel_net::H264_PAYLOAD_TYPE,
+    );
+    start("screen share", &description, Vec::new(), None)
+}
+
+/// Captures the primary monitor via Windows Graphics Capture — like
+/// macOS, no source-picker yet, so this shares the whole primary screen
+/// (Windows 11 draws its yellow "being captured" border; that's the OS).
+/// The capture lands in D3D11 memory, so it's downloaded to system memory
+/// before the software convert/scale front-end (see
+/// [`codec::video_postproc`]).
+#[cfg(target_os = "windows")]
+pub async fn screen() -> anyhow::Result<Capture> {
+    let description = format!(
+        "d3d11screencapturesrc show-cursor=true ! d3d11download ! video/x-raw \
          ! {postproc} ! video/x-raw ! {encoder} \
          ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
          ! appsink name=sink emit-signals=false sync=false",
