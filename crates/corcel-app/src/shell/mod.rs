@@ -339,7 +339,7 @@ impl ProfileForm {
     fn new(cx: &mut Context<Shell>) -> Self {
         Self {
             name_input: cx.new(|cx| TextInput::new_hero("Your name", cx)),
-            bio_input: cx.new(|cx| TextInput::new("A line about you (optional)", cx)),
+            bio_input: cx.new(|cx| TextInput::new_ghost("A line about you (optional)", cx)),
             avatar_path: None,
             banner_path: None,
             error: None,
@@ -610,6 +610,24 @@ impl Shell {
             }
         })
         .detach();
+
+        // Dev shortcut: CORCEL_DEBUG_PROFILE=1 opens the edit-profile
+        // modal on launch, for iterating on it visually.
+        if std::env::var("CORCEL_DEBUG_PROFILE").is_ok() {
+            if let Some(profile) = shell.profile.clone() {
+                shell
+                    .profile_form
+                    .name_input
+                    .update(cx, |input, cx| input.set_content(profile.name.clone(), cx));
+                shell
+                    .profile_form
+                    .bio_input
+                    .update(cx, |input, cx| input.set_content(profile.bio.clone().unwrap_or_default(), cx));
+                shell.profile_form.avatar_path = profile.avatar_path;
+                shell.profile_form.banner_path = profile.banner_path;
+                shell.edit_profile_open = true;
+            }
+        }
 
         // Dev shortcut: CORCEL_DEBUG_CHANNEL=1 opens the first server's
         // first text channel on launch, so chat UI can be screenshotted

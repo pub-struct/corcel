@@ -433,9 +433,9 @@ impl Shell {
                 .size_full()
                 .rounded_t_xl()
                 .bg(linear_gradient(
-                    120.,
-                    linear_color_stop(rgba(0x5865f2ff), 0.),
-                    linear_color_stop(rgba(0x00a8fcff), 1.),
+                    135.,
+                    linear_color_stop(rgba(0x232b36ff), 0.),
+                    linear_color_stop(rgba(0x131417ff), 1.),
                 ))
                 .flex()
                 .items_center()
@@ -445,10 +445,10 @@ impl Shell {
                         .px(px(10.))
                         .py(px(5.))
                         .rounded_full()
-                        .bg(rgba(0x00000038))
-                        .text_size(px(11.5))
+                        .bg(rgba(0x00000052))
+                        .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgba(0xffffffd8))
+                        .text_color(rgba(0xffffff8c))
                         .child("Click to add a banner"),
                 )
                 .into_any_element(),

@@ -52,6 +52,9 @@ pub struct TextInput {
     /// underline that lights up with focus) instead of the boxed default —
     /// for onboarding screens where the input *is* the page, not a form row.
     hero: bool,
+    /// Renders with no box at all — plain display text that happens to be
+    /// editable (the profile card's bio).
+    ghost: bool,
 }
 
 impl TextInput {
@@ -67,12 +70,19 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             hero: false,
+            ghost: false,
         }
     }
 
     pub fn new_hero(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         let mut input = Self::new(placeholder, cx);
         input.hero = true;
+        input
+    }
+
+    pub fn new_ghost(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::new(placeholder, cx);
+        input.ghost = true;
         input
     }
 
@@ -579,15 +589,21 @@ impl Render for TextInput {
             .w_full();
 
         if self.hero {
+            // Underline only while focused: at rest the name reads as the
+            // card's display text, not a form field.
             let focused = self.focus_handle.is_focused(window);
             base.border_b_2()
-                .border_color(if focused { theme::ring() } else { theme::input_border() })
+                .border_color(if focused { theme::ring() } else { gpui::rgba(0x00000000) })
                 .line_height(px(34.))
                 .text_size(px(26.))
                 .font_weight(FontWeight::BOLD)
                 .child(
                     div().h(px(34. + 6. * 2.)).w_full().py(px(6.)).child(TextElement { input: cx.entity() }),
                 )
+        } else if self.ghost {
+            base.line_height(px(19.)).text_size(px(13.5)).text_color(theme::muted_foreground()).child(
+                div().h(px(19. + 4. * 2.)).w_full().py(px(4.)).child(TextElement { input: cx.entity() }),
+            )
         } else {
             base.bg(theme::card())
                 .border_1()
