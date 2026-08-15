@@ -1436,7 +1436,6 @@ impl Shell {
                         wash.a = 0.08;
                         style.bg(wash).border_l_2().border_color(theme::mention()).pl(px(14.))
                     })
-                    .children(actions)
                     .child(div().flex_none().child(theme::avatar(avatar, initial, px(36.))))
                     .child(
                         div()
@@ -1478,6 +1477,10 @@ impl Shell {
                             .children(thread_chip)
                             .children(palette),
                     )
+                    // Painted last so it sits over everything in the row —
+                    // as an earlier sibling, a reply row's quote line drew
+                    // straight through it.
+                    .children(actions)
             })
             .collect::<Vec<_>>();
 
