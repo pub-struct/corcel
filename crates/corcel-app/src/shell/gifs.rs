@@ -210,7 +210,7 @@ impl Shell {
                 .into_any_element()
         };
 
-        div().mx(px(16.)).flex().child(
+        div().mx(px(16.)).flex().justify_end().child(
             div()
                 .id("gif-picker")
                 .flex()
