@@ -458,6 +458,9 @@ pub(crate) struct Shell {
     /// it and schedules a search 350ms out that only fires if it's still
     /// the newest (see [`gifs`]).
     gif_search_generation: u64,
+    /// Whether the picker was opened from the thread composer — a picked
+    /// GIF then lands in the open thread instead of the channel.
+    gif_picker_for_thread: bool,
     /// The last query actually searched, so settling on the same text
     /// doesn't refetch.
     gif_last_query: String,
@@ -546,6 +549,7 @@ impl Shell {
             gif_loading: false,
             gif_error: None,
             gif_search_generation: 0,
+            gif_picker_for_thread: false,
             gif_last_query: String::new(),
             reacting_to: None,
             chat_reactions: HashMap::new(),

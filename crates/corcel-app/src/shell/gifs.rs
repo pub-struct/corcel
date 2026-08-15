@@ -73,13 +73,14 @@ fn fetch_gifs(key: &str, query: &str) -> anyhow::Result<Vec<GifResult>> {
 }
 
 impl Shell {
-    pub(super) fn toggle_gif_picker(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_gif_picker(&mut self, for_thread: bool, cx: &mut Context<Self>) {
         if self.gif_picker_open {
             self.gif_picker_open = false;
             cx.notify();
             return;
         }
         self.gif_picker_open = true;
+        self.gif_picker_for_thread = for_thread;
         self.gif_error = None;
         if giphy_key().is_none() {
             self.gif_results.clear();
@@ -142,7 +143,11 @@ impl Shell {
 
     pub(super) fn send_gif(&mut self, url: String, cx: &mut Context<Self>) {
         self.gif_picker_open = false;
-        self.send_message_body(url, cx);
+        if self.gif_picker_for_thread && self.open_thread.is_some() {
+            self.send_thread_body(url, cx);
+        } else {
+            self.send_message_body(url, cx);
+        }
     }
 
     /// The panel floating above the composer: a query field and the result

@@ -768,11 +768,18 @@ impl Shell {
     /// a normal message with `thread_root` set, stored and broadcast
     /// exactly like [`Self::send_chat_message`]'s.
     pub(super) fn send_thread_message(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.open_thread.clone() else { return };
         let body = self.thread_input.read(cx).content.trim().to_string();
         if body.is_empty() {
             return;
         }
+        self.send_thread_body(body, cx);
+        self.thread_input.update(cx, |input, cx| input.clear(cx));
+    }
+
+    /// Sends `body` as a reply in the open thread — shared by the thread
+    /// composer and the GIF picker.
+    pub(super) fn send_thread_body(&mut self, body: String, cx: &mut Context<Self>) {
+        let Some(root) = self.open_thread.clone() else { return };
         let Some((server_id, _)) = self.visible_text_channel() else { return };
         let author = self.profile.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "?".to_string());
         let message = ChatMessage {
@@ -792,7 +799,6 @@ impl Shell {
         self.send_room(server_id, ChatPayload::Message(message.clone()), None);
         self.thread_messages.push(message);
         self.refresh_threads(root.channel);
-        self.thread_input.update(cx, |input, cx| input.clear(cx));
         cx.notify();
     }
 
@@ -1726,7 +1732,7 @@ impl Shell {
                     .hover(|style| style.bg(theme::wash_strong()).text_color(theme::foreground()))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|shell, _, _window, cx| shell.toggle_gif_picker(cx)),
+                        cx.listener(|shell, _, _window, cx| shell.toggle_gif_picker(false, cx)),
                     )
                     .child("GIF"),
             );
@@ -1872,12 +1878,41 @@ impl Shell {
             .px(px(10.))
             .pb(px(10.))
             .pt(px(4.))
+            .relative()
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, _window, cx| {
                 if event.keystroke.key == "enter" {
                     shell.send_thread_message(cx);
                 }
             }))
-            .child(self.thread_input.clone());
+            .child(self.thread_input.clone())
+            .child(
+                div()
+                    .id("thread-gif-button")
+                    .absolute()
+                    .right(px(18.))
+                    .bottom(px(17.))
+                    .w(px(36.))
+                    .h(px(24.))
+                    .rounded(px(7.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if self.gif_picker_open && self.gif_picker_for_thread {
+                        theme::wash_strong()
+                    } else {
+                        theme::wash()
+                    })
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::muted_foreground())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::wash_strong()).text_color(theme::foreground()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|shell, _, _window, cx| shell.toggle_gif_picker(true, cx)),
+                    )
+                    .child("GIF"),
+            );
 
         div()
             .w(px(THREAD_PANEL_WIDTH))
