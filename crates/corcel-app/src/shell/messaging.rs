@@ -5,10 +5,69 @@
 
 use super::*;
 
-/// The fixed reaction palette — no emoji picker yet, these six cover the
-/// Discord staples. Each renders as an inline button under a message when
-/// its "add reaction" action is clicked.
+/// The quick-reaction row pinned at the top of the emoji picker — the
+/// Discord staples, one click away without scrolling.
 const REACTION_PALETTE: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "🎉"];
+
+/// The full picker, by category. Curated rather than exhaustive — a
+/// friends-scale set that covers what people actually react with, kept
+/// to single-codepoint-ish emoji that every platform's fallback font
+/// renders (no ZWJ sequences, whose support is spottier).
+const EMOJI_CATEGORIES: &[(&str, &[&str])] = &[
+    (
+        "Smileys",
+        &[
+            "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣", "😊", "😇", "🙂", "😉", "😌", "😍", "🥰", "😘",
+            "😋", "😛", "😜", "🤪", "🤨", "🧐", "🤓", "😎", "🥳", "😏", "😒", "😞", "😔", "😟", "😕", "🙁",
+            "😣", "😖", "😫", "😩", "🥺", "😢", "😭", "😤", "😠", "😡", "🤬", "🤯", "😳", "🥵", "🥶", "😱",
+            "😨", "😰", "😥", "🤗", "🤔", "🤭", "🤫", "🤥", "😶", "😐", "😑", "😬", "🙄", "😯", "😴", "🤤",
+            "😷", "🤒", "🤕", "🤢", "🤮", "🥴", "😵", "🤠", "🤑", "💀", "👻", "👽", "🤖", "💩", "🤡",
+        ],
+    ),
+    (
+        "Gestures",
+        &[
+            "👍", "👎", "👊", "✊", "🤛", "🤜", "👏", "🙌", "👐", "🤲", "🤝", "🙏", "✌️", "🤞", "🤟", "🤘",
+            "👌", "🤌", "🤏", "👈", "👉", "👆", "👇", "☝️", "✋", "🤚", "🖐️", "🖖", "👋", "🤙", "💪", "🖕",
+        ],
+    ),
+    (
+        "Hearts",
+        &[
+            "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🤎", "💔", "❣️", "💕", "💞", "💓", "💗", "💖",
+            "💘", "💝", "💟", "♥️", "🔥", "✨", "⭐", "🌟", "💫", "💥", "💯", "💢", "💦", "💨",
+        ],
+    ),
+    (
+        "Animals",
+        &[
+            "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐮", "🐷", "🐸", "🐵", "🙈",
+            "🙉", "🙊", "🐔", "🐧", "🐦", "🦆", "🦅", "🦉", "🐺", "🐗", "🐴", "🦄", "🐝", "🐛", "🦋", "🐌",
+        ],
+    ),
+    (
+        "Food",
+        &[
+            "🍏", "🍎", "🍐", "🍊", "🍋", "🍌", "🍉", "🍇", "🍓", "🍈", "🍒", "🍑", "🥭", "🍍", "🥥", "🥝",
+            "🍅", "🥑", "🌽", "🥕", "🍕", "🍔", "🍟", "🌭", "🥪", "🌮", "🍜", "🍣", "🍦", "🍩", "🍪", "🎂",
+            "🍿", "☕", "🍺", "🍻", "🥂", "🍷", "🥃", "🧉",
+        ],
+    ),
+    (
+        "Activities",
+        &[
+            "⚽", "🏀", "🏈", "⚾", "🎾", "🏐", "🎱", "🏓", "🎯", "🎮", "🕹️", "🎲", "🧩", "🎬", "🎤", "🎧",
+            "🎸", "🎹", "🥁", "🎺", "🎻", "🎨", "🏆", "🥇", "🥈", "🥉", "🏅", "🎪", "🚀", "✈️", "🚗", "🏁",
+        ],
+    ),
+    (
+        "Symbols",
+        &[
+            "✅", "❌", "❓", "❗", "⚠️", "🚫", "💤", "🔔", "🔕", "🎉", "🎊", "🎈", "🎁", "🔑", "🔒", "🔓",
+            "💡", "🔦", "🔧", "🔨", "💣", "🧨", "📌", "📎", "✏️", "📝", "📖", "💰", "💎", "🧠", "👀", "🗿",
+        ],
+    ),
+];
 
 impl Shell {
     pub(super) fn open_text_channel(&mut self, channel: ChannelInfo, cx: &mut Context<Self>) {
@@ -919,39 +978,87 @@ impl Shell {
                         ))
                     });
 
-                // The inline emoji palette, opened by the smile action. The
-                // extra flex wrapper keeps it content-sized instead of
-                // stretching across the column.
+                // The emoji picker, opened by the smile action: the staple
+                // quick row pinned on top, then every category in one
+                // scrollable grid. The extra flex wrapper keeps it
+                // content-sized instead of stretching across the column.
                 let palette = palette_open.then(|| {
-                    div().flex().mt(px(4.)).child(
+                    let cell = |emoji: &'static str, cx: &mut Context<Self>| {
+                        div()
+                            .size(px(30.))
+                            .rounded_md()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::wash_strong()))
+                            .text_size(px(16.))
+                            .child(emoji)
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _, _window, cx| {
+                                    shell.toggle_reaction(message_id, emoji, cx);
+                                }),
+                            )
+                    };
+                    let quick_row = div()
+                        .flex()
+                        .gap(px(2.))
+                        .pb(px(4.))
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .children(REACTION_PALETTE.iter().map(|emoji| cell(emoji, cx)));
+                    // Collected eagerly: a lazy iterator would hold the
+                    // `cx` borrow into the container build below.
+                    let sections: Vec<_> = EMOJI_CATEGORIES.iter().map(|(category, emojis)| {
                         div()
                             .flex()
-                            .gap(px(2.))
-                            .p(px(3.))
-                            .rounded_md()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .pt(px(6.))
+                                    .pb(px(2.))
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::muted_foreground())
+                                    .child(*category),
+                            )
+                            .child(
+                                div().flex().flex_wrap().gap(px(2.)).children(
+                                    emojis.iter().map(|emoji| cell(emoji, cx)).collect::<Vec<_>>(),
+                                ),
+                            )
+                    }).collect();
+                    div().flex().mt(px(4.)).child(
+                        div()
+                            .id(SharedString::from(format!("emoji-picker-{message_id}")))
+                            .flex()
+                            .flex_col()
+                            .w(px(292.))
+                            .h(px(260.))
+                            .p(px(6.))
+                            .rounded_lg()
                             .bg(theme::popover())
                             .border_1()
                             .border_color(theme::border())
                             .shadow_md()
-                            .children(REACTION_PALETTE.iter().map(|emoji| {
-                                let emoji = *emoji;
+                            .on_mouse_down_out(cx.listener(|shell, _, _window, cx| {
+                                if shell.reacting_to.take().is_some() {
+                                    cx.notify();
+                                }
+                            }))
+                            .child(quick_row)
+                            .child(
                                 div()
-                                    .size(px(30.))
-                                    .rounded_md()
+                                    .id(SharedString::from(format!("emoji-scroll-{message_id}")))
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
                                     .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme::wash_strong()))
-                                    .text_size(px(16.))
-                                    .child(emoji)
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |shell, _, _window, cx| {
-                                            shell.toggle_reaction(message_id, emoji, cx);
-                                        }),
-                                    )
-                            })),
+                                    .flex_col()
+                                    .children(sections),
+                            ),
                     )
                 });
 
