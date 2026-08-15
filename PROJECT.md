@@ -29,11 +29,21 @@ screen share, relayed through the host, running reliably on Linux/GNOME/Wayland.
 
 ## Architecture Decisions
 
-1. **Signaling — ephemeral `wss://` relay.** A minimal, stateless WebSocket
-   relay carries only the SDP/ICE handshake for a few hundred ms at call
-   setup. It never touches live media, and TLS costs nothing here since it's
-   not in the real-time path — it just closes off a MITM risk on the one
-   part of the system that WebRTC's own DTLS doesn't already protect.
+1. **Signaling — ephemeral relay over iroh.** A minimal, stateless relay
+   (hosted by whichever peer created the server) carries the SDP/ICE
+   handshake and chat-room traffic. It's served over an [iroh] QUIC
+   endpoint: invite links carry the relay's public key (endpoint id)
+   instead of an IP address, iroh's public relay/DNS infrastructure
+   handles rendezvous and hole-punching, and connections work across the
+   open internet — different countries, CGNAT, changing IPs — with zero
+   user configuration. The QUIC handshake against the endpoint id is the
+   trust model (it proves the host holds the matching key), which closes
+   off the MITM risk on the one part of the system WebRTC's own DTLS
+   doesn't already protect. (Originally a TCP `wss://` relay with
+   certificate-fingerprint pinning; replaced because LAN-address links
+   made cross-network connection impossible.)
+
+   [iroh]: https://www.iroh.computer
 
 2. **Screen capture — Wayland ScreenCast via PipeWire + `xdg-desktop-portal`.**
    Matches the current machine (GNOME/Wayland). GNOME's portal
@@ -57,7 +67,11 @@ screen share, relayed through the host, running reliably on Linux/GNOME/Wayland.
    unlike everything else here, it's an ongoing bandwidth-cost commitment
    rather than a one-time build task, so it's a deliberate later decision.
    Known limitation: calls between peers on hard/symmetric NATs may fail to
-   connect in this phase.
+   connect in this phase. This applies to WebRTC *media* only — signaling
+   and chat ride the iroh transport (decision 1), which has relayed
+   fallback and always connects. Routing media over iroh too (retiring
+   this limitation and the TURN question with it) is the natural next
+   step.
 
 6. **Call topology — host-relay (SFU-lite), not mesh.** Each participant
    uploads their stream once, to the channel's host; the host forwards

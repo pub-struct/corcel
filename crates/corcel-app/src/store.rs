@@ -126,10 +126,14 @@ impl Store {
             // A row whose link no longer decodes (e.g. written by a newer
             // build) is skipped rather than wedging the whole app at launch.
             let Ok(link) = ServerLink::decode(&link) else { continue };
-            let identity = match (cert_der, key_der) {
-                (Some(cert_der), Some(key_der)) => Some(RelayIdentity { cert_der, key_der }),
-                _ => None,
-            };
+            // The identity lives in `key_der` as a raw 32-byte iroh secret
+            // key. Rows written by the pre-iroh transport hold a TLS key
+            // there instead — `from_bytes` rejects those (wrong length), so
+            // they load as identity-less and the shell mints a fresh key on
+            // its rehost pass. `cert_der` is a leftover from that era,
+            // ignored on load and written as NULL ever since.
+            let _ = cert_der;
+            let identity = key_der.as_deref().and_then(RelayIdentity::from_bytes);
             servers.push(SavedServer { link, is_host, identity });
         }
         Ok(servers)
@@ -138,10 +142,8 @@ impl Store {
     /// Inserts or updates a server row (keyed by `link.id`), appending it to
     /// the end of the rail if it's new.
     pub fn save_server(&self, server: &SavedServer) -> anyhow::Result<()> {
-        let (cert_der, key_der) = match &server.identity {
-            Some(identity) => (Some(identity.cert_der.clone()), Some(identity.key_der.clone())),
-            None => (None, None),
-        };
+        let key_der = server.identity.as_ref().map(RelayIdentity::to_bytes);
+        let cert_der: Option<Vec<u8>> = None;
         self.conn.execute(
             "INSERT INTO servers (id, link, is_host, cert_der, key_der, position)
              VALUES (?1, ?2, ?3, ?4, ?5,

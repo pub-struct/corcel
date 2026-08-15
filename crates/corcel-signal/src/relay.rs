@@ -1,4 +1,4 @@
-//! The host side of a server's wss:// signaling relay.
+//! The host side of a server's signaling relay, served over iroh.
 //!
 //! When a peer starts hosting a server, it spawns one of these locally. It
 //! knows nothing about SDP/ICE semantics — it just routes opaque
@@ -9,58 +9,75 @@
 //! sets used as the chat mesh, where it broadcasts/routes opaque JSON
 //! payloads with the same "never inspect, only deliver" contract.
 //!
-//! TLS uses a self-signed certificate whose fingerprint travels inside the
-//! invite link so joining clients can pin against it (see [`crate::client`])
-//! instead of trusting a CA. The certificate is a [`RelayIdentity`] the
-//! caller persists and hands back on every spawn — regenerating it per
-//! process would silently invalidate every invite link ever shared for the
-//! server, since the pinned fingerprint would no longer match.
+//! Transport is an [`iroh`] endpoint rather than a plain socket, which is
+//! what makes invite links work across the open internet with zero user
+//! configuration: joining clients dial the host's [`EndpointId`] (a public
+//! key carried in the invite link), iroh's public relay/DNS infrastructure
+//! handles the rendezvous, and the connection hole-punches to a direct
+//! QUIC path where the NATs allow it (falling back to relayed traffic where
+//! they don't). The endpoint id doubles as the trust anchor — the QUIC
+//! handshake proves the host holds the matching secret key, replacing the
+//! old self-signed-certificate fingerprint pinning outright. The secret key
+//! is the [`RelayIdentity`] the caller persists and hands back on every
+//! spawn — regenerating it per process would silently invalidate every
+//! invite link ever shared for the server.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use futures_util::{SinkExt, StreamExt};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
-use tokio::net::{TcpListener, TcpStream};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
-use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::protocol::{ChannelId, ClientMessage, PeerId, ServerMessage};
 
+/// The ALPN this relay accepts. Bump the trailing number on any wire-format
+/// break — iroh refuses mismatched ALPNs at handshake, which beats a JSON
+/// parse error deep into a session.
+pub const ALPN: &[u8] = b"corcel/signal/1";
+
 pub struct Relay {
-    pub port: u16,
-    pub fingerprint: [u8; 32],
+    /// What invite links carry — the stable, publicly-dialable identity.
+    pub endpoint_id: EndpointId,
+    /// The full local address (direct socket addrs included), registered
+    /// with [`crate::client`] so the host's own connections to this relay
+    /// go straight over loopback instead of waiting for discovery to find
+    /// their own machine.
+    pub addr: EndpointAddr,
 }
 
-/// The relay's TLS identity: a self-signed certificate plus its private key,
-/// both DER-encoded so they round-trip through storage as plain blobs. This
-/// is what makes a hosted server *the same server* across app restarts —
-/// invite links pin the certificate's fingerprint, so as long as the caller
-/// persists this and spawns with it again, old links keep verifying.
+/// The relay's identity: an iroh secret key, kept as raw bytes so it
+/// round-trips through storage as a plain blob. This is what makes a hosted
+/// server *the same server* across app restarts — invite links carry the
+/// public [`EndpointId`], so as long as the caller persists this and spawns
+/// with it again, old links keep dialing (and keep authenticating: the QUIC
+/// handshake proves possession of this key).
 #[derive(Clone)]
 pub struct RelayIdentity {
-    pub cert_der: Vec<u8>,
-    /// PKCS#8 private key DER.
-    pub key_der: Vec<u8>,
+    secret: [u8; 32],
 }
 
 impl RelayIdentity {
     pub fn generate() -> anyhow::Result<Self> {
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(vec!["corcel-host".to_string()])?;
-        Ok(Self {
-            cert_der: cert.der().to_vec(),
-            key_der: signing_key.serialize_der(),
-        })
+        Ok(Self { secret: SecretKey::generate().to_bytes() })
     }
 
-    /// The value invite links pin against (see [`crate::client::connect`]).
-    pub fn fingerprint(&self) -> [u8; 32] {
-        Sha256::digest(&self.cert_der).into()
+    /// Rebuilds a persisted identity. `None` for blobs that aren't an iroh
+    /// secret key — e.g. rows written by the pre-iroh TLS transport.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let secret: [u8; 32] = bytes.try_into().ok()?;
+        Some(Self { secret })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.secret.to_vec()
+    }
+
+    /// The value invite links carry (and joining clients authenticate).
+    pub fn endpoint_id(&self) -> EndpointId {
+        SecretKey::from_bytes(&self.secret).public()
     }
 }
 
@@ -122,47 +139,50 @@ type Channels = Arc<Mutex<HashMap<ChannelId, ChannelState>>>;
 /// app uses the *server's* id as its room key).
 type Rooms = Arc<Mutex<HashMap<ChannelId, HashMap<PeerId, mpsc::UnboundedSender<ServerMessage>>>>>;
 
-/// Binds a local listener with the given persisted TLS identity and starts
-/// accepting wss connections in the background. The task runs for the
-/// lifetime of the process — there's no shutdown handle yet, which is fine
-/// for a relay whose whole reason to exist is "as long as the host's app is
+/// Binds an iroh endpoint on the given persisted identity and starts
+/// accepting connections in the background. The task runs for the lifetime
+/// of the process — there's no shutdown handle yet, which is fine for a
+/// relay whose whole reason to exist is "as long as the host's app is
 /// open."
-pub async fn spawn(bind_addr: SocketAddr, identity: &RelayIdentity) -> anyhow::Result<Relay> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cert_der: CertificateDer<'static> = CertificateDer::from(identity.cert_der.clone());
-    let fingerprint = identity.fingerprint();
-    let key_der: PrivateKeyDer<'static> =
-        PrivatePkcs8KeyDer::from(identity.key_der.clone()).into();
-
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)?;
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
-
-    let listener = TcpListener::bind(bind_addr).await?;
-    let port = listener.local_addr()?.port();
+pub async fn spawn(identity: &RelayIdentity) -> anyhow::Result<Relay> {
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(SecretKey::from_bytes(&identity.secret))
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await?;
+    let endpoint_id = endpoint.id();
+    let addr = endpoint.addr();
+    crate::client::register_local_relay(addr.clone());
 
     let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
-        loop {
-            let Ok((stream, _peer_addr)) = listener.accept().await else {
-                continue;
-            };
-            let acceptor = acceptor.clone();
+        while let Some(incoming) = endpoint.accept().await {
             let channels = channels.clone();
             let rooms = rooms.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(stream, acceptor, channels, rooms).await {
-                    tracing_stub_log(&err);
+                let result = async {
+                    let conn = incoming.accept()?.await?;
+                    anyhow::Ok(conn)
+                }
+                .await;
+                match result {
+                    Ok(conn) => {
+                        if let Err(err) = handle_connection(conn, channels, rooms).await {
+                            tracing_stub_log(&err);
+                        }
+                    }
+                    // Handshake failures are background noise on an open
+                    // QUIC socket (stray datagrams, wrong ALPN) — log and
+                    // move on, same as the doc on `Incoming::accept` says.
+                    Err(err) => tracing_stub_log(&err),
                 }
             });
         }
     });
 
-    Ok(Relay { port, fingerprint })
+    Ok(Relay { endpoint_id, addr })
 }
 
 // Small placeholder so we're not silently swallowing connection errors
@@ -172,17 +192,18 @@ fn tracing_stub_log(err: &anyhow::Error) {
 }
 
 async fn handle_connection(
-    tcp: TcpStream,
-    acceptor: TlsAcceptor,
+    conn: iroh::endpoint::Connection,
     channels: Channels,
     rooms: Rooms,
 ) -> anyhow::Result<()> {
-    let tls = acceptor.accept(tcp).await?;
-    let ws = tokio_tungstenite::accept_async(tls).await?;
-    let (mut outgoing, mut incoming) = ws.split();
+    // One bi-directional stream per connection, newline-delimited JSON both
+    // ways — the exact message types the WebSocket transport carried, minus
+    // the WebSocket.
+    let (mut writer, reader) = conn.accept_bi().await?;
+    let mut lines = BufReader::new(reader).lines();
 
-    let first = match incoming.next().await {
-        Some(Ok(Message::Text(text))) => text,
+    let first = match lines.next_line().await {
+        Ok(Some(line)) => line,
         _ => return Ok(()), // client vanished before saying hello
     };
     let (channel_id, peer_id, role) = match serde_json::from_str::<ClientMessage>(&first)? {
@@ -191,7 +212,7 @@ async fn handle_connection(
         ClientMessage::Watch { channel } => (channel, Uuid::new_v4(), Role::Watcher),
         ClientMessage::Room { channel } => (channel, Uuid::new_v4(), Role::Member),
         ClientMessage::Relay { .. } | ClientMessage::Publish { .. } | ClientMessage::Direct { .. } => {
-            let _ = send(&mut outgoing, &ServerMessage::Error {
+            let _ = send(&mut writer, &ServerMessage::Error {
                 message: "expected Host, Join, Watch, or Room as the first message".into(),
             })
             .await;
@@ -252,18 +273,17 @@ async fn handle_connection(
         }
     }
 
-    // Forward the per-connection outbound queue to the actual socket.
+    // Forward the per-connection outbound queue to the actual stream.
     let forward = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if send(&mut outgoing, &msg).await.is_err() {
+            if send(&mut writer, &msg).await.is_err() {
                 break;
             }
         }
     });
 
-    while let Some(msg) = incoming.next().await {
-        let Ok(Message::Text(text)) = msg else { break };
-        let Ok(msg) = serde_json::from_str::<ClientMessage>(&text) else { continue };
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(msg) = serde_json::from_str::<ClientMessage>(&line) else { continue };
         match (&role, msg) {
             (Role::Host | Role::Participant, ClientMessage::Relay { to, payload }) => {
                 let target = channels.lock().unwrap().get(&channel_id).and_then(|s| s.sender_for(to));
@@ -343,14 +363,11 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn send(
-    outgoing: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>,
-        Message,
-    >,
-    msg: &ServerMessage,
-) -> anyhow::Result<()> {
-    let text = serde_json::to_string(msg)?;
-    outgoing.send(Message::Text(text.into())).await?;
+async fn send(writer: &mut iroh::endpoint::SendStream, msg: &ServerMessage) -> anyhow::Result<()> {
+    let mut text = serde_json::to_string(msg)?;
+    // serde_json escapes control characters inside strings, so the message
+    // itself can never contain a raw newline — one line, one message.
+    text.push('\n');
+    writer.write_all(text.as_bytes()).await?;
     Ok(())
 }

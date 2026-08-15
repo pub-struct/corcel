@@ -14,7 +14,6 @@ mod switcher;
 mod workspace;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,7 +27,7 @@ use gpui::{
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-use corcel_signal::{ClientMessage, PeerId, ServerMessage};
+use corcel_signal::{ClientMessage, PeerId, RelayIdentity, ServerMessage};
 
 use crate::assets::icons;
 use crate::chat::{self, ChatMessage, ChatPayload, ReactionRow};
@@ -124,7 +123,7 @@ impl Render for VideoSurface {
     }
 }
 
-/// The live state of a channel once [`session::join`]/[`join_as_host`]
+/// The live state of a channel once [`session::join`]
 /// connects: the connection handle (to start screen sharing later), the
 /// video surface entity the frame-pump task feeds, this side's screen-share,
 /// camera, and mute state, and the stop signal for the call's background
@@ -462,13 +461,33 @@ impl Shell {
 
     /// Brings every hosted server's relay back up on launch (see
     /// [`session::rehost`]) — this is what makes a hosted server persist
-    /// across restarts with the same identity/fingerprint, so old invite
-    /// links keep working. The returned link (the address/port can change)
-    /// replaces the saved one.
-    fn start_rehosts(&self, cx: &mut Context<Self>) {
-        for server in &self.servers {
+    /// across restarts with the same identity, hence the same endpoint id,
+    /// so old invite links keep working from any network.
+    fn start_rehosts(&mut self, cx: &mut Context<Self>) {
+        for server in &mut self.servers {
             if !server.is_host {
                 continue;
+            }
+            // A hosted row that loaded identity-less was written by the
+            // pre-iroh transport (its stored key was a TLS key the new
+            // transport rejects). Mint a fresh iroh key and persist it: the
+            // server keeps its id, name, and message history, but comes up
+            // under a new endpoint id — links shared before the transport
+            // switch are dead either way (they carried a LAN address, not
+            // an endpoint id), so members need a fresh invite regardless.
+            if server.identity.is_none() {
+                match RelayIdentity::generate() {
+                    Ok(identity) => {
+                        server.identity = Some(identity);
+                        if let Some(store) = &self.store {
+                            let _ = store.save_server(server);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("corcel-app: couldn't mint a relay identity: {err:#}");
+                        continue;
+                    }
+                }
             }
             let Some(identity) = server.identity.clone() else { continue };
             let name = server.link.name.clone();

@@ -142,6 +142,14 @@ impl Shell {
         let text = self.join_link_input.read(cx).content.to_string();
         match ServerLink::decode(text.trim()) {
             Ok(link) => {
+                // A link that decodes but carries no endpoint id is from
+                // the pre-iroh transport — it can never be dialed, so say
+                // so now rather than saving it and retrying in silence.
+                if let Err(err) = link.endpoint_id() {
+                    self.error = Some(format!("invalid invite link: {err:#}"));
+                    cx.notify();
+                    return;
+                }
                 let id = link.id;
                 if let Some(existing) = self.servers.iter_mut().find(|s| s.link.id == id) {
                     // Already a member — a re-pasted invite just refreshes

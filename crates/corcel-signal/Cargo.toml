@@ -6,17 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
-futures-util = "0.3.34"
-rcgen = "0.14.9"
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
+iroh = "1.0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha2 = "0.11.0"
-thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
-tokio-tungstenite = "0.30.0"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 
 [dev-dependencies]

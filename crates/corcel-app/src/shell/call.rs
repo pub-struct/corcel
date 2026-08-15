@@ -37,17 +37,14 @@ impl Shell {
         }
         let Some(server) = self.servers.iter().find(|s| s.link.id == server_id) else { return };
         let link = server.link.clone();
-        let is_host = server.is_host;
 
         self.call = Some(ActiveCall { server_id, channel: channel.clone(), status: ChannelStatus::Connecting });
         self.screen = Screen::Server { id: server_id, view: ServerView::Voice { channel: channel.clone() } };
         cx.notify();
 
-        let rx = if is_host {
-            runtime::spawn_and_send(session::join_as_host(link, channel.id))
-        } else {
-            runtime::spawn_and_send(session::join(link, channel.id))
-        };
+        // Host and guest join identically — the signal client dials the
+        // link's endpoint id and short-circuits same-process relays itself.
+        let rx = runtime::spawn_and_send(session::join(link, channel.id));
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let session = match result {

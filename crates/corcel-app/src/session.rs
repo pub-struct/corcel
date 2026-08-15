@@ -5,85 +5,56 @@
 //! mirrors, and [`crate::session`]'s callers for how results cross back onto
 //! the GPUI thread.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
 use corcel_net::{CallHandle, Participant};
-use corcel_signal::{ChannelId, ClientMessage, RelayIdentity};
+use corcel_signal::{ChannelId, ClientMessage, EndpointId, RelayIdentity};
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::invite::{ChannelInfo, ChannelKind, ServerLink};
 
-/// Best-effort LAN-reachable address for this machine — a UDP "connect"
-/// never actually sends a packet, it just asks the kernel which local
-/// interface would be used to route toward the given address, which is a
-/// reasonable default for "the address other people on this network should
-/// use". Falls back to loopback (fine for same-machine testing) if that
-/// fails, e.g. no network at all.
-fn local_ip() -> IpAddr {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| {
-            socket.connect("8.8.8.8:80")?;
-            socket.local_addr()
-        })
-        .map(|addr| addr.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
-}
-
-/// Creates a brand-new server: mints its identity (id + TLS cert), spawns
-/// its relay, and starts hosting the default channels. The caller persists
-/// the returned identity so [`rehost`] can bring the same server (same
-/// fingerprint, so same invite links) back after a restart.
+/// Creates a brand-new server: mints its identity (server id + iroh secret
+/// key), spawns its relay, and starts hosting the default channels. The
+/// caller persists the returned identity so [`rehost`] can bring the same
+/// server (same endpoint id, so the *same invite links*) back after a
+/// restart.
 pub async fn host(name: String) -> anyhow::Result<(ServerLink, RelayIdentity)> {
     let identity = RelayIdentity::generate()?;
     let channels = vec![
         ChannelInfo { id: Uuid::new_v4(), name: "general".to_string(), kind: ChannelKind::Text },
         ChannelInfo { id: Uuid::new_v4(), name: "General".to_string(), kind: ChannelKind::Voice },
     ];
-    let link = spawn_and_host(Uuid::new_v4(), name, channels, &identity, 0).await?;
+    let link = spawn_and_host(Uuid::new_v4(), name, channels, &identity).await?;
     Ok((link, identity))
 }
 
-/// Brings a persisted hosted server back up after an app restart, preferring
-/// the port its invite links already point at. If that port is taken by
-/// something else, falls back to any free port — the server stays usable and
-/// its fingerprint (the actual trust anchor) is unchanged, but previously
-/// shared links carry the old port, so the caller should persist the
-/// returned link and members re-share invites.
+/// Brings a persisted hosted server back up after an app restart. Because
+/// the relay's dialable identity is its key (not an address), the returned
+/// link is equivalent to the old one — links shared months ago keep
+/// working, from any network the host wanders to.
 pub async fn rehost(link: ServerLink, identity: RelayIdentity) -> anyhow::Result<ServerLink> {
-    let preferred = link.addr.port();
-    match spawn_and_host(link.id, link.name.clone(), link.channels.clone(), &identity, preferred).await {
-        Ok(link) => Ok(link),
-        Err(_) if preferred != 0 => spawn_and_host(link.id, link.name, link.channels, &identity, 0).await,
-        Err(err) => Err(err),
-    }
+    spawn_and_host(link.id, link.name, link.channels, &identity).await
 }
 
-/// Spawns the relay with `identity` on `port` and starts a host-side media
-/// relay for every *voice* channel (text channels need no host claim — chat
-/// flows through the relay's room, not a WebRTC session). Returns the link
-/// to share, with `addr` freshly derived from the machine's current LAN
-/// address — the id and fingerprint are the stable parts, the address is
-/// re-derived every launch.
+/// Spawns the relay with `identity` and starts a host-side media relay for
+/// every *voice* channel (text channels need no host claim — chat flows
+/// through the relay's room, not a WebRTC session). Returns the link to
+/// share; everything in it is stable across launches.
 async fn spawn_and_host(
     server_id: Uuid,
     name: String,
     channels: Vec<ChannelInfo>,
     identity: &RelayIdentity,
-    port: u16,
 ) -> anyhow::Result<ServerLink> {
-    let relay =
-        corcel_signal::relay::spawn(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port), identity).await?;
-    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay.port);
+    let relay = corcel_signal::relay::spawn(identity).await?;
+    let relay_id = relay.endpoint_id;
 
     for channel in &channels {
         if channel.kind != ChannelKind::Voice {
             continue;
         }
         let id = channel.id;
-        let fingerprint = relay.fingerprint;
         tokio::spawn(async move {
-            let conn = match corcel_signal::client::connect(loopback, fingerprint, ClientMessage::Host { channel: id }).await {
+            let conn = match corcel_signal::client::connect(relay_id, ClientMessage::Host { channel: id }).await {
                 Ok(conn) => conn,
                 Err(err) => {
                     eprintln!("corcel-app: failed to host channel {id}: {err:#}");
@@ -99,47 +70,35 @@ async fn spawn_and_host(
     Ok(ServerLink {
         id: server_id,
         name,
-        addr: SocketAddr::new(local_ip(), relay.port),
-        fingerprint: relay.fingerprint,
+        node: Some(relay_id.to_string()),
         channels,
     })
 }
 
 /// Opens this member's chat-room connection to a server's relay: the
-/// long-lived websocket every chat broadcast, direct history exchange, and
-/// room-presence event flows over. `addr` is the link's address for remote
-/// members, or loopback when the host connects to its own relay.
+/// long-lived stream every chat broadcast, direct history exchange, and
+/// room-presence event flows over. The host dials its own relay the same
+/// way — [`corcel_signal::client`] short-circuits same-process relays to
+/// loopback internally.
 pub async fn open_room(
-    addr: SocketAddr,
-    fingerprint: [u8; 32],
+    relay: EndpointId,
     server_id: Uuid,
 ) -> anyhow::Result<corcel_signal::client::Connection> {
-    corcel_signal::client::connect(addr, fingerprint, ClientMessage::Room { channel: server_id }).await
+    corcel_signal::client::connect(relay, ClientMessage::Room { channel: server_id }).await
 }
 
-/// Joins a channel already listed in `link`, connecting to `addr` — the
-/// link's own address for a remote participant, or loopback when the
-/// server's own host is joining its own channel (see
-/// [`corcel_signal::client`]'s doc comment on why the host also connects
-/// to its own relay as a plain participant, same as everyone else). Once
-/// connected, starts streaming mic audio in and remote audio out — see
-/// [`attach_media`].
-async fn join_at(addr: SocketAddr, fingerprint: [u8; 32], channel: ChannelId) -> anyhow::Result<CallSession> {
-    let conn = corcel_signal::client::connect(addr, fingerprint, ClientMessage::Join { channel }).await?;
+/// Joins a channel already listed in `link` — host and guest use the exact
+/// same path (see [`corcel_signal::client`]'s doc comment on why the host
+/// also connects to its own relay as a plain participant, same as everyone
+/// else). Once connected, starts streaming mic audio in and remote audio
+/// out — see [`attach_media`].
+pub async fn join(link: ServerLink, channel: ChannelId) -> anyhow::Result<CallSession> {
+    let conn = corcel_signal::client::connect(link.endpoint_id()?, ClientMessage::Join { channel }).await?;
     let participant = corcel_net::join(conn).await?;
     attach_media(participant).await
 }
 
-pub async fn join(link: ServerLink, channel: ChannelId) -> anyhow::Result<CallSession> {
-    join_at(link.addr, link.fingerprint, channel).await
-}
-
-pub async fn join_as_host(link: ServerLink, channel: ChannelId) -> anyhow::Result<CallSession> {
-    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), link.addr.port());
-    join_at(loopback, link.fingerprint, channel).await
-}
-
-/// A live call, handed back to the UI once [`join`]/[`join_as_host`]
+/// A live call, handed back to the UI once [`join`]
 /// connects: `pc` lets it publish more tracks later (e.g. [`start_screen_share`]),
 /// and `remote_video` streams decoded frames from whatever video track(s)
 /// the host forwards, for rendering.

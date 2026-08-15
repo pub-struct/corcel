@@ -119,28 +119,32 @@ impl Shell {
                 }
                 attempt += 1;
 
-                // Re-read the address every attempt — a rehost may have
-                // moved the relay to a new port while we were backing off.
-                // The host reaches its own relay over loopback: its link
-                // carries the LAN address, which some networks won't
-                // hairpin back.
+                // Re-read the link every attempt — on launch a legacy
+                // hosted server may still be waiting for start_rehosts to
+                // mint its endpoint id. Host and guest dial the same id;
+                // the signal client short-circuits same-process relays to
+                // loopback itself, so no hairpin special-casing here.
+                // Outer Option: is this room loop still current (and its
+                // server still saved)? Inner: does the link have a dialable
+                // endpoint id yet?
                 let target = this.update(cx, |shell, _| {
                     if shell.room_generation(server_id) != generation {
                         return None;
                     }
-                    shell.servers.iter().find(|s| s.link.id == server_id).map(|server| {
-                        let addr = if server.is_host {
-                            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server.link.addr.port())
-                        } else {
-                            server.link.addr
-                        };
-                        (addr, server.link.fingerprint)
-                    })
+                    shell
+                        .servers
+                        .iter()
+                        .find(|s| s.link.id == server_id)
+                        .map(|server| server.link.endpoint_id().ok())
                 });
-                let Ok(Some((addr, fingerprint))) = target else { return };
+                let relay = match target {
+                    Ok(Some(Some(relay))) => relay,
+                    Ok(Some(None)) => continue, // legacy link, id not minted yet
+                    _ => return,                // superseded, removed, or shell gone
+                };
 
                 let Ok(Ok(mut conn)) =
-                    runtime::spawn_and_send(session::open_room(addr, fingerprint, server_id)).await
+                    runtime::spawn_and_send(session::open_room(relay, server_id)).await
                 else {
                     continue;
                 };

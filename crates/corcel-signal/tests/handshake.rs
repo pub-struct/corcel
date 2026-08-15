@@ -1,26 +1,22 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
 use corcel_signal::{ClientMessage, ServerMessage, SignalPayload};
 
 #[tokio::test]
 async fn host_and_participant_exchange_a_signal() {
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let identity =
         corcel_signal::RelayIdentity::generate().expect("identity should generate");
-    let relay = corcel_signal::relay::spawn(bind, &identity)
+    let relay = corcel_signal::relay::spawn(&identity)
         .await
         .expect("relay should start");
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay.port);
+    // Same-process connections resolve through the local-relay registry
+    // (direct loopback addresses), so this test needs no network and no
+    // discovery infrastructure.
+    let relay_id = relay.endpoint_id;
 
     let channel = uuid::Uuid::new_v4();
 
-    let mut host = corcel_signal::client::connect(
-        addr,
-        relay.fingerprint,
-        ClientMessage::Host { channel },
-    )
-    .await
-    .expect("host should connect");
+    let mut host = corcel_signal::client::connect(relay_id, ClientMessage::Host { channel })
+        .await
+        .expect("host should connect");
 
     let host_peer = match host.inbound.recv().await.expect("host welcome") {
         ServerMessage::Welcome { your_peer, host } => {
@@ -30,13 +26,9 @@ async fn host_and_participant_exchange_a_signal() {
         other => panic!("expected Welcome, got {other:?}"),
     };
 
-    let mut participant = corcel_signal::client::connect(
-        addr,
-        relay.fingerprint,
-        ClientMessage::Join { channel },
-    )
-    .await
-    .expect("participant should connect");
+    let mut participant = corcel_signal::client::connect(relay_id, ClientMessage::Join { channel })
+        .await
+        .expect("participant should connect");
 
     let participant_peer = match participant.inbound.recv().await.expect("participant welcome") {
         ServerMessage::Welcome { your_peer, host } => {
