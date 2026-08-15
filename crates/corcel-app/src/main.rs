@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt, App, Application, Bounds, ClipboardItem, Context, Div, Entity, Focusable, FontWeight,
@@ -312,6 +312,14 @@ struct Shell {
     switcher_open: bool,
     switcher_input: Entity<TextInput>,
     switcher_selected: usize,
+    /// Who's typing where: `(channel, author) → last Typing payload seen`.
+    /// Entries expire on this machine's clock (a repeating prune task
+    /// spawned in [`Shell::new`]) — the sender never says "stopped typing",
+    /// silence does.
+    typing: HashMap<(Uuid, String), Instant>,
+    /// When this user last broadcast a Typing payload — throttles the
+    /// composer to one broadcast per few seconds, not one per keystroke.
+    last_typing_sent: Option<Instant>,
     add_server_open: bool,
     /// Briefly `true` after "Copy Invite Link" so the button itself can
     /// confirm the copy happened — clipboard writes are otherwise invisible.
@@ -347,6 +355,8 @@ impl Shell {
             switcher_open: false,
             switcher_input: cx.new(|cx| TextInput::new("Where would you like to go?", cx)),
             switcher_selected: 0,
+            typing: HashMap::new(),
+            last_typing_sent: None,
             add_server_open: false,
             link_copied: false,
             error,
@@ -364,6 +374,28 @@ impl Shell {
         if let Some(id) = shell.servers.first().map(|server| server.link.id) {
             shell.open_server(id, cx);
         }
+
+        // The typing-indicator janitor: whoever stops typing just goes
+        // silent, so their entry has to age out here. Lives for the whole
+        // app; the notify only fires when something actually expired.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let alive = this.update(cx, |shell, cx| {
+                    let now = Instant::now();
+                    let before = shell.typing.len();
+                    shell.typing.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(6));
+                    if shell.typing.len() != before {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+
         shell
     }
 
@@ -886,11 +918,11 @@ impl Shell {
                     .unwrap_or(0);
                 self.send_room(server_id, ChatPayload::HistoryRequest { since }, Some(peer));
             }
-            ServerMessage::Published { payload, .. } => {
-                if let Ok(ChatPayload::Message(message)) = serde_json::from_value(payload) {
-                    self.absorb_messages(server_id, vec![message], cx);
-                }
-            }
+            ServerMessage::Published { payload, .. } => match serde_json::from_value(payload) {
+                Ok(ChatPayload::Message(message)) => self.absorb_messages(server_id, vec![message], cx),
+                Ok(ChatPayload::Typing { channel, author }) => self.note_typing(channel, author, cx),
+                _ => {}
+            },
             ServerMessage::Direct { from, payload } => match serde_json::from_value(payload) {
                 // Someone else is catching up — serve them from our store.
                 // Every member can do this; that's what makes the owner's
@@ -902,7 +934,8 @@ impl Shell {
                 }
                 Ok(ChatPayload::HistoryBatch { messages }) => self.absorb_messages(server_id, messages, cx),
                 Ok(ChatPayload::Message(message)) => self.absorb_messages(server_id, vec![message], cx),
-                Err(_) => {}
+                // Typing is broadcast-only; a direct one is a peer bug.
+                Ok(ChatPayload::Typing { .. }) | Err(_) => {}
             },
             _ => {}
         }
@@ -922,6 +955,10 @@ impl Shell {
     /// [`store::Store::insert_message`]) and, if any were actually new and
     /// their channel is on screen, refreshes the visible list.
     fn absorb_messages(&mut self, server_id: Uuid, messages: Vec<ChatMessage>, cx: &mut Context<Self>) {
+        // An arrived message beats any "…is typing" from its author.
+        for message in &messages {
+            self.typing.remove(&(message.channel, message.author.clone()));
+        }
         let mut any_new = false;
         {
             let Some(store) = self.store.as_ref() else { return };
@@ -954,6 +991,40 @@ impl Shell {
         cx.notify();
     }
 
+    /// Records someone else's Typing payload; re-renders only if their
+    /// channel is the one on screen (the strip is the only UI for it).
+    fn note_typing(&mut self, channel: Uuid, author: String, cx: &mut Context<Self>) {
+        if author == self.my_name() {
+            return;
+        }
+        self.typing.insert((channel, author), Instant::now());
+        if matches!(
+            &self.screen,
+            Screen::Server { view: ServerView::Text { channel: viewing }, .. } if viewing.id == channel
+        ) {
+            cx.notify();
+        }
+    }
+
+    /// Called on every keystroke that lands in the composer: broadcasts a
+    /// Typing payload if there's real content and the last one is stale.
+    fn maybe_send_typing(&mut self, cx: &mut Context<Self>) {
+        let (server_id, channel_id) = match &self.screen {
+            Screen::Server { id, view: ServerView::Text { channel } } => (*id, channel.id),
+            _ => return,
+        };
+        if self.message_input.read(cx).content.trim().is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        if self.last_typing_sent.is_some_and(|at| now.duration_since(at) < Duration::from_secs(3)) {
+            return;
+        }
+        self.last_typing_sent = Some(now);
+        let author = self.my_name();
+        self.send_room(server_id, ChatPayload::Typing { channel: channel_id, author }, None);
+    }
+
     fn send_chat_message(&mut self, cx: &mut Context<Self>) {
         let body = self.message_input.read(cx).content.trim().to_string();
         if body.is_empty() {
@@ -975,6 +1046,9 @@ impl Shell {
         }
         self.send_room(server_id, ChatPayload::Message(message.clone()), None);
         self.chat_messages.push(message);
+        // The sent message supersedes "…is typing"; the next keystroke of a
+        // new draft should announce immediately again.
+        self.last_typing_sent = None;
         self.message_input.update(cx, |input, cx| input.clear(cx));
         self.chat_scroll.scroll_to_bottom();
         cx.notify();
@@ -2370,19 +2444,53 @@ impl Shell {
             .children(empty_state)
             .children(message_rows);
 
+        // Always-rendered 18px strip so the composer doesn't jump when the
+        // first "…is typing" appears.
+        let mut typing_names: Vec<&str> = self
+            .typing
+            .keys()
+            .filter(|(typing_channel, _)| *typing_channel == channel.id)
+            .map(|(_, author)| author.as_str())
+            .collect();
+        typing_names.sort_unstable();
+        let typing_label = match typing_names.as_slice() {
+            [] => String::new(),
+            [one] => format!("{one} is typing…"),
+            [one, two] => format!("{one} and {two} are typing…"),
+            _ => "Several people are typing…".to_string(),
+        };
+        let typing_strip = div()
+            .flex_none()
+            .h(px(18.))
+            .px(px(16.))
+            .text_size(px(11.5))
+            .text_color(theme::muted_foreground())
+            .child(typing_label);
+
         let composer = div()
             .flex_none()
             .px(px(16.))
             .pb(px(16.))
-            .pt(px(4.))
+            .pt(px(2.))
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, _window, cx| {
                 if event.keystroke.key == "enter" {
                     shell.send_chat_message(cx);
+                } else {
+                    shell.maybe_send_typing(cx);
                 }
             }))
             .child(self.message_input.clone());
 
-        div().flex_1().min_w_0().h_full().flex().flex_col().child(header).child(scrollback).child(composer)
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(scrollback)
+            .child(typing_strip)
+            .child(composer)
     }
 
     /// The main panel for the active server: lobby welcome, a text channel's

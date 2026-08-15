@@ -53,6 +53,11 @@ pub enum ChatPayload {
     /// (fine at friends scale; chunking can come when someone's history is
     /// big enough to need it).
     HistoryBatch { messages: Vec<ChatMessage> },
+    /// "I'm composing a message in this channel" — broadcast at most every
+    /// few seconds while typing. Purely ephemeral: never stored, expires on
+    /// the receiver's clock, and old builds drop the unknown tag silently
+    /// (their deserialization already ignores payloads it can't parse).
+    Typing { channel: ChannelId, author: String },
 }
 
 /// The author's current unix time in milliseconds — the timestamp stamped
