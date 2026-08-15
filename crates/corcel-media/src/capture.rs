@@ -13,7 +13,7 @@ use std::pin::Pin;
 use anyhow::Context;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::{codec, pipeline, rtp};
 
@@ -85,6 +85,20 @@ fn start(
     pipeline::watch(&gst_pipeline, label);
     gst_pipeline.set_state(gstreamer::State::Playing)?;
 
+    let packets = pump_packets(label, sink);
+    Ok(Capture {
+        gst_pipeline,
+        packets,
+        _keep_alive: keep_alive,
+        on_close,
+    })
+}
+
+/// Spawns the thread that pulls encoded samples out of the pipeline's
+/// appsink and parses them into RTP packets — shared by every capture,
+/// whether its bus is watched by [`pipeline::watch`] or (the microphone)
+/// by its own combined watcher.
+fn pump_packets(label: &'static str, sink: AppSink) -> mpsc::Receiver<rtc::rtp::Packet> {
     let (tx, rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
     std::thread::spawn(move || {
         while let Ok(sample) = sink.pull_sample() {
@@ -106,13 +120,7 @@ fn start(
             }
         }
     });
-
-    Ok(Capture {
-        gst_pipeline,
-        packets: rx,
-        _keep_alive: keep_alive,
-        on_close,
-    })
+    rx
 }
 
 /// Captures from a V4L2 camera device (e.g. `/dev/video0`).
@@ -129,16 +137,108 @@ pub fn camera(device: &str) -> anyhow::Result<Capture> {
     start("camera", &description, Vec::new(), None)
 }
 
+/// RMS loudness (dBFS) above which the mic counts as someone speaking.
+/// ~-40 dB sits comfortably between room tone / keyboard noise and an
+/// actual voice at normal mic gain.
+const SPEAKING_THRESHOLD_DB: f64 = -40.0;
+
+/// How long the speaking flag stays up after the level last crossed the
+/// threshold, so the natural dips between words don't flicker it.
+const SPEAKING_HANGOVER: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Captures from the default PipeWire audio source (GNOME/Wayland routes
-/// the system mic through PipeWire, same as screen capture).
-pub fn microphone() -> anyhow::Result<Capture> {
+/// the system mic through PipeWire, same as screen capture). Also returns
+/// a live "someone is speaking into this mic" flag, measured *before* the
+/// encoder by GStreamer's `level` element — so it keeps reporting while
+/// the app-level mute merely discards the encoded packets downstream.
+pub fn microphone() -> anyhow::Result<(Capture, watch::Receiver<bool>)> {
     let description = format!(
         "pipewiresrc ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
-         ! opusenc ! rtpopuspay pt={pt} \
+         ! level interval=100000000 ! opusenc ! rtpopuspay pt={pt} \
          ! appsink name=sink emit-signals=false sync=false",
         pt = corcel_net::OPUS_PAYLOAD_TYPE,
     );
-    start("microphone", &description, Vec::new(), None)
+    let gst_pipeline = pipeline::build(&description)?;
+    let sink = pipeline::element::<AppSink>(&gst_pipeline, "sink")?;
+    // Not `pipeline::watch` — a bus supports only one popping consumer, and
+    // this pipeline needs its Element messages (the `level` reports) read
+    // alongside Error/EOS. One combined thread does both.
+    let speaking = watch_microphone_bus(&gst_pipeline);
+    gst_pipeline.set_state(gstreamer::State::Playing)?;
+
+    let packets = pump_packets("microphone", sink);
+    let capture = Capture {
+        gst_pipeline,
+        packets,
+        _keep_alive: Vec::new(),
+        on_close: None,
+    };
+    Ok((capture, speaking))
+}
+
+/// The microphone pipeline's bus thread: plays [`pipeline::watch`]'s role
+/// (log the first error / EOS) *and* turns the `level` element's periodic
+/// loudness reports into an edge-triggered speaking flag. The thread exits
+/// when [`pipeline::stop`] flushes the bus (the `Capture`'s `Drop`),
+/// resetting the flag to `false` on the way out.
+fn watch_microphone_bus(gst_pipeline: &gstreamer::Pipeline) -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(false);
+    let Some(bus) = gst_pipeline.bus() else { return rx };
+    std::thread::spawn(move || {
+        // When the level last crossed the threshold — the hangover only
+        // needs re-evaluating when a report arrives, and reports tick every
+        // 100ms for as long as the pipeline runs.
+        let mut last_loud: Option<std::time::Instant> = None;
+        while let Some(msg) = bus.timed_pop_filtered(
+            gstreamer::ClockTime::NONE,
+            &[
+                gstreamer::MessageType::Error,
+                gstreamer::MessageType::Eos,
+                gstreamer::MessageType::Element,
+            ],
+        ) {
+            match msg.view() {
+                gstreamer::MessageView::Error(err) => {
+                    eprintln!(
+                        "corcel-media: microphone pipeline error: {} ({:?})",
+                        err.error(),
+                        err.debug()
+                    );
+                    break;
+                }
+                gstreamer::MessageView::Eos(_) => break,
+                gstreamer::MessageView::Element(element) => {
+                    let Some(report) = element.structure().filter(|s| s.name() == "level") else {
+                        continue;
+                    };
+                    // "rms" is one dBFS value per channel; the loudest
+                    // channel decides (a mono voice on a stereo capture
+                    // shouldn't be halved into silence).
+                    let Ok(rms) = report.get::<gstreamer::glib::ValueArray>("rms") else {
+                        continue;
+                    };
+                    let loudest = rms
+                        .iter()
+                        .filter_map(|value| value.get::<f64>().ok())
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let now = std::time::Instant::now();
+                    if loudest > SPEAKING_THRESHOLD_DB {
+                        last_loud = Some(now);
+                    }
+                    let speaking =
+                        last_loud.is_some_and(|at| now.duration_since(at) < SPEAKING_HANGOVER);
+                    tx.send_if_modified(|current| {
+                        let changed = *current != speaking;
+                        *current = speaking;
+                        changed
+                    });
+                }
+                _ => {}
+            }
+        }
+        let _ = tx.send(false);
+    });
+    rx
 }
 
 /// Captures the screen via the `org.freedesktop.portal.ScreenCast` portal

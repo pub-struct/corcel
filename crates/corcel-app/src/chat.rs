@@ -102,6 +102,12 @@ pub enum ChatPayload {
     /// the receiver's clock, and old builds drop the unknown tag silently
     /// (their deserialization already ignores payloads it can't parse).
     Typing { channel: ChannelId, author: String },
+    /// "My mic went hot / quiet in this voice channel" — broadcast on
+    /// transitions of the sender's local speech detector, suppressed while
+    /// they're muted. Ephemeral exactly like [`ChatPayload::Typing`]: never
+    /// stored, expires on the receiver's clock (the safety net for a peer
+    /// that vanishes mid-word and never sends its `false`).
+    Speaking { channel: ChannelId, author: String, speaking: bool },
 }
 
 /// The author's current unix time in milliseconds — the timestamp stamped

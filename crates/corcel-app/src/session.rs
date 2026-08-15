@@ -162,6 +162,17 @@ pub struct CallSession {
     /// re-open), but nothing leaves the machine — which is what "muted" has
     /// to mean to be trustworthy.
     pub mute: watch::Sender<bool>,
+    /// Live deafen switch for every incoming-audio playback task: while
+    /// `true`, received packets are dropped instead of pushed to the
+    /// speaker — the mirror image of `mute`, applied on the way in. Tracks
+    /// keep flowing (undeafen is instant); they just make no sound.
+    pub deafen: watch::Sender<bool>,
+    /// `true` while the local mic hears someone talking (see
+    /// [`corcel_media::capture::microphone`]) — drives this side's speaking
+    /// ring and, via the shell's watcher, the broadcast to everyone else.
+    /// Reports raw mic activity even while muted; the consumer decides what
+    /// muted means for display.
+    pub speaking: watch::Receiver<bool>,
     /// A sender into the same frame channel `remote_video` reads from, so
     /// local capture ([`start_screen_share`]/[`start_camera`]) can feed its
     /// own self-preview frames to the very stage that renders remote video —
@@ -182,8 +193,9 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
     let Participant { pc, mut tracks, .. } = participant;
     let (hang_up_tx, hang_up_rx) = watch::channel(false);
     let (mute_tx, mute_rx) = watch::channel(false);
+    let (deafen_tx, deafen_rx) = watch::channel(false);
 
-    let mut mic = corcel_media::capture::microphone()?;
+    let (mut mic, speaking_rx) = corcel_media::capture::microphone()?;
     let outgoing = corcel_net::publish_audio_track(&pc).await?;
     let mut stop_rx = hang_up_rx.clone();
     tokio::spawn(async move {
@@ -227,12 +239,18 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
                     }
                 };
                 let mut stop_rx = hang_up_rx.clone();
+                let deafen_rx = deafen_rx.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
                             _ = stop_rx.changed() => break,
                             packet = packets.recv() => {
                                 let Some(packet) = packet else { break };
+                                // Deafened: drop instead of play — same
+                                // trustworthy shape as the mic loop's mute.
+                                if *deafen_rx.borrow() {
+                                    continue;
+                                }
                                 let _ = playback.push(&packet);
                             }
                         }
@@ -274,7 +292,15 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
         }
     });
 
-    Ok(CallSession { pc, remote_video: video_rx, hang_up: hang_up_tx, mute: mute_tx, local_video })
+    Ok(CallSession {
+        pc,
+        remote_video: video_rx,
+        hang_up: hang_up_tx,
+        mute: mute_tx,
+        deafen: deafen_tx,
+        speaking: speaking_rx,
+        local_video,
+    })
 }
 
 /// A screen share started with [`start_screen_share`]. Dropping/[`stop`]ping

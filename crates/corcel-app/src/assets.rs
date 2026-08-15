@@ -14,6 +14,8 @@ pub struct Assets;
 /// the call site instead of a silently blank icon at runtime.
 pub mod icons {
     pub const HASH: &str = "icons/hash.svg";
+    pub const HEADPHONE_OFF: &str = "icons/headphone-off.svg";
+    pub const HEADPHONES: &str = "icons/headphones.svg";
     pub const LINK: &str = "icons/link.svg";
     pub const LOG_OUT: &str = "icons/log-out.svg";
     pub const MIC: &str = "icons/mic.svg";
@@ -35,6 +37,8 @@ pub mod icons {
 
 const ASSETS: &[(&str, &[u8])] = &[
     (icons::HASH, include_bytes!("../assets/icons/hash.svg")),
+    (icons::HEADPHONE_OFF, include_bytes!("../assets/icons/headphone-off.svg")),
+    (icons::HEADPHONES, include_bytes!("../assets/icons/headphones.svg")),
     (icons::LINK, include_bytes!("../assets/icons/link.svg")),
     (icons::LOG_OUT, include_bytes!("../assets/icons/log-out.svg")),
     (icons::MIC, include_bytes!("../assets/icons/mic.svg")),

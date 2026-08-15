@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt, App, Application, Bounds, ClipboardItem, Context, Div, Entity, Focusable, FontWeight,
-    ImageSource, KeyDownEvent, MouseButton, MouseUpEvent, ObjectFit, PathPromptOptions, Render, RenderImage, Rgba,
+    ImageSource, KeyDownEvent, KeyUpEvent, MouseButton, MouseUpEvent, ObjectFit, PathPromptOptions, Render,
+    RenderImage, Rgba,
     ScrollHandle, SharedString, Stateful, TitlebarOptions, Transformation, Window, WindowBounds, WindowOptions,
     deferred, div, img, prelude::*, px, radians, size,
 };
@@ -48,6 +49,12 @@ const SIDEBAR_WIDTH: f32 = 240.;
 /// Discord staples. Each renders as an inline button under a message when
 /// its "add reaction" action is clicked.
 const REACTION_PALETTE: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "🎉"];
+
+/// How long a remote peer's speaking ring survives without a fresh
+/// `Speaking { true }`. Transitions are explicit (unlike typing, silence
+/// isn't the signal here — `false` is), so this is only the safety net for
+/// a peer that disconnects mid-word and never sends its `false`.
+const SPEAKING_EXPIRY: Duration = Duration::from_secs(3);
 
 /// Screen-share state for a connected call. `Pending` covers the window
 /// between the user clicking "Share Screen" and [`session::start_screen_share`]
@@ -93,6 +100,11 @@ struct VideoSurface {
     name: SharedString,
     avatar: Option<PathBuf>,
     initial: SharedString,
+    /// Whether this side's mic is currently audible — drives the green ring
+    /// on the placeholder tile's avatar. Fed by the call's speaking watcher
+    /// (see [`Shell::enter_voice_channel`]); living here means the ~word-rate
+    /// flicker of speech re-renders only this view, like `frame` does.
+    speaking: bool,
 }
 
 impl Render for VideoSurface {
@@ -112,6 +124,7 @@ impl Render for VideoSurface {
                     self.initial.clone(),
                     self.name.clone(),
                     "No one is sharing video — audio only",
+                    self.speaking,
                 ))
                 .into_any_element(),
         }
@@ -134,6 +147,26 @@ struct ConnectedCall {
     /// would work but hides the "this is UI state" intent.
     muted: bool,
     mute: watch::Sender<bool>,
+    /// Mirror of `deafen`, same reasoning as `muted`.
+    deafened: bool,
+    deafen: watch::Sender<bool>,
+    /// What `muted` was when deafen last switched on — deafen implies mute
+    /// (Discord's rule), and undeafening restores this instead of blindly
+    /// unmuting someone who was already muted on their own.
+    muted_before_deafen: bool,
+    /// Push-to-talk: while on, the mic idles muted and holding Space (with
+    /// no text input focused) unmutes for the duration of the hold.
+    ptt_enabled: bool,
+    /// Whether this side's mic is currently audible to the room — the local
+    /// speech detector's flag gated by `!muted`. Drives our own green ring
+    /// with zero network latency (and doubles as a mic-works indicator).
+    self_speaking: bool,
+    /// A second handle on the mic's speaking flag for synchronous reads —
+    /// the primary receiver is consumed by the watcher task. Lets unmute
+    /// paths (button, deafen restore, push-to-talk) light the ring
+    /// immediately when the mic is already hot, instead of waiting for the
+    /// detector's next off→on edge.
+    speaking_rx: watch::Receiver<bool>,
     hang_up: watch::Sender<bool>,
     /// Sender into the stage's frame channel, handed to
     /// [`session::start_screen_share`]/[`session::start_camera`] so the
@@ -325,6 +358,10 @@ struct Shell {
     /// When this user last broadcast a Typing payload — throttles the
     /// composer to one broadcast per few seconds, not one per keystroke.
     last_typing_sent: Option<Instant>,
+    /// Who's audibly speaking where: `(voice channel, author) → last
+    /// Speaking { true } seen`. Cleared by their explicit `false`, or aged
+    /// out by the janitor if that never arrives (see [`SPEAKING_EXPIRY`]).
+    speaking: HashMap<(Uuid, String), Instant>,
     /// The message the composer is currently replying to — stamped onto the
     /// next send as its `reply_to`, shown as a bar above the composer, and
     /// cleared by Escape, ✕, or sending.
@@ -376,6 +413,7 @@ impl Shell {
             switcher_selected: 0,
             typing: HashMap::new(),
             last_typing_sent: None,
+            speaking: HashMap::new(),
             replying_to: None,
             editing: None,
             reacting_to: None,
@@ -398,17 +436,20 @@ impl Shell {
             shell.open_server(id, cx);
         }
 
-        // The typing-indicator janitor: whoever stops typing just goes
-        // silent, so their entry has to age out here. Lives for the whole
-        // app; the notify only fires when something actually expired.
+        // The ephemeral-presence janitor: whoever stops typing just goes
+        // silent, so their entry has to age out here; speaking entries are
+        // normally cleared by an explicit `false` and this is their crash
+        // safety net. Lives for the whole app; the notify only fires when
+        // something actually expired.
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
                 let alive = this.update(cx, |shell, cx| {
                     let now = Instant::now();
-                    let before = shell.typing.len();
+                    let before = shell.typing.len() + shell.speaking.len();
                     shell.typing.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(6));
-                    if shell.typing.len() != before {
+                    shell.speaking.retain(|_, seen| now.duration_since(*seen) < SPEAKING_EXPIRY);
+                    if shell.typing.len() + shell.speaking.len() != before {
                         cx.notify();
                     }
                 });
@@ -829,6 +870,17 @@ impl Shell {
             return;
         }
         if !self.switcher_open {
+            // Push-to-talk: Space held (and not typing anywhere) opens the
+            // mic. Key auto-repeat re-fires this, which `set_muted`'s
+            // no-change guard absorbs.
+            if key == "space" && !self.text_input_focused(window, cx) {
+                let holding =
+                    self.connected_call_mut().is_some_and(|call| call.ptt_enabled && !call.deafened);
+                if holding {
+                    self.set_muted(false, cx);
+                    return;
+                }
+            }
             // Escape unwinds in-flight message state, most-specific first:
             // an open edit, then the emoji palette, then the reply setup.
             if key == "escape" {
@@ -854,6 +906,19 @@ impl Shell {
                 cx.notify();
             }
             _ => {}
+        }
+    }
+
+    /// The release half of push-to-talk. Runs even if a text input has
+    /// focus by the time the key comes up — if PTT never unmuted (the press
+    /// landed in a composer), re-muting is a no-op anyway.
+    fn root_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key.as_str() != "space" {
+            return;
+        }
+        let holding = self.connected_call_mut().is_some_and(|call| call.ptt_enabled && !call.deafened);
+        if holding {
+            self.set_muted(true, cx);
         }
     }
 
@@ -993,6 +1058,9 @@ impl Shell {
                     self.absorb_delete(server_id, message_id, channel, cx);
                 }
                 Ok(ChatPayload::Reaction(reaction)) => self.absorb_reactions(server_id, vec![reaction], cx),
+                Ok(ChatPayload::Speaking { channel, author, speaking }) => {
+                    self.note_speaking(channel, author, speaking, cx);
+                }
                 _ => {}
             },
             ServerMessage::Direct { from, payload } => match serde_json::from_value(payload) {
@@ -1145,6 +1213,23 @@ impl Shell {
             &self.screen,
             Screen::Server { view: ServerView::Text { channel: viewing }, .. } if viewing.id == channel
         ) {
+            cx.notify();
+        }
+    }
+
+    /// Records someone else's Speaking transition (or the periodic `true`
+    /// refresh that keeps the janitor's expiry at bay during long
+    /// stretches of talking). Re-renders only on actual ring changes.
+    fn note_speaking(&mut self, channel: Uuid, author: String, speaking: bool, cx: &mut Context<Self>) {
+        if author == self.my_name() {
+            return;
+        }
+        let changed = if speaking {
+            self.speaking.insert((channel, author), Instant::now()).is_none()
+        } else {
+            self.speaking.remove(&(channel, author)).is_some()
+        };
+        if changed {
             cx.notify();
         }
     }
@@ -1325,9 +1410,17 @@ impl Shell {
                 cx.notify();
                 return;
             }
-            // Switching calls: tear the old one down first.
+            // Switching calls: tear the old one down first (and clear our
+            // speaking ring there — its watcher dies with it).
             if let ChannelStatus::Connected(connected) = &call.status {
                 hang_up(connected);
+                let (old_server, old_channel) = (call.server_id, call.channel.id);
+                let author = self.my_name();
+                self.send_room(
+                    old_server,
+                    ChatPayload::Speaking { channel: old_channel, author, speaking: false },
+                    None,
+                );
             }
         }
         let Some(server) = self.servers.iter().find(|s| s.link.id == server_id) else { return };
@@ -1367,7 +1460,9 @@ impl Shell {
                 }
             };
 
-            let CallSession { pc, mut remote_video, hang_up: hang_up_tx, mute, local_video } = session;
+            let CallSession { pc, mut remote_video, hang_up: hang_up_tx, mute, deafen, speaking, local_video } =
+                session;
+            let channel_id = channel.id;
             let surface = this.update(cx, |shell, cx| {
                 let profile = shell.profile.as_ref();
                 let surface = cx.new(|_| VideoSurface {
@@ -1375,6 +1470,7 @@ impl Shell {
                     name: profile.map(|p| p.name.clone()).unwrap_or_default().into(),
                     avatar: profile.and_then(|p| p.avatar_path.clone()),
                     initial: profile.map(|p| p.initial()).unwrap_or_else(|| "?".to_string()).into(),
+                    speaking: false,
                 });
                 let call = ConnectedCall {
                     pc,
@@ -1383,11 +1479,18 @@ impl Shell {
                     camera: CameraState::Idle,
                     muted: false,
                     mute,
+                    deafened: false,
+                    deafen,
+                    muted_before_deafen: false,
+                    ptt_enabled: false,
+                    self_speaking: false,
+                    speaking_rx: speaking.clone(),
                     hang_up: hang_up_tx,
                     local_video,
                 };
-                if let Some(active) = shell.call.as_mut().filter(|active| active.channel.id == channel.id) {
+                if let Some(active) = shell.call.as_mut().filter(|active| active.channel.id == channel_id) {
                     active.status = ChannelStatus::Connected(call);
+                    shell.spawn_speaking_watcher(channel_id, speaking, cx);
                     cx.notify();
                     return Some(surface);
                 }
@@ -1428,6 +1531,15 @@ impl Shell {
         let Some(call) = self.call.take() else { return };
         if let ChannelStatus::Connected(connected) = &call.status {
             hang_up(connected);
+            // The speaking watcher dies with the call and can't say this
+            // for us — clear our ring for everyone explicitly rather than
+            // leaving it to their expiry timer.
+            let author = self.my_name();
+            self.send_room(
+                call.server_id,
+                ChatPayload::Speaking { channel: call.channel.id, author, speaking: false },
+                None,
+            );
         }
         // If that channel's stage was on screen, fall back to the lobby.
         if let Screen::Server { id, view: ServerView::Voice { channel } } = &self.screen {
@@ -1460,12 +1572,157 @@ impl Shell {
         }
     }
 
-    fn toggle_mute_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(call) = self.connected_call_mut() {
-            call.muted = !call.muted;
-            let _ = call.mute.send(call.muted);
-            cx.notify();
+    /// Bridges the mic's speech detector to the rest of the app. A
+    /// tokio-side task turns the watch channel into events — every
+    /// transition, plus a `true` refresh every 2 seconds while hot, so
+    /// receivers' [`SPEAKING_EXPIRY`] never fires mid-sentence — and a
+    /// GPUI-side task applies each event: own ring state, the stage tile,
+    /// and the room broadcast (gated to `false` while muted, so mute means
+    /// "nothing about my mic leaves this machine", not just no audio).
+    fn spawn_speaking_watcher(&self, channel_id: Uuid, mut detector: watch::Receiver<bool>, cx: &mut Context<Self>) {
+        // The tokio half exists because racing a timer against the watch
+        // channel needs a real timer driver, which GPUI's executor lacks.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        drop(runtime::spawn_and_send(async move {
+            loop {
+                let speaking = *detector.borrow();
+                if event_tx.send(speaking).is_err() {
+                    return;
+                }
+                if speaking {
+                    tokio::select! {
+                        changed = detector.changed() => { if changed.is_err() { break; } }
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    }
+                } else if detector.changed().await.is_err() {
+                    break;
+                }
+            }
+            // The detector's gone (mic torn down) — the last word is "off".
+            let _ = event_tx.send(false);
+        }));
+
+        cx.spawn(async move |this, cx| {
+            // Skips re-broadcasting `false` while muted-and-talking; only
+            // `true` needs the periodic refresh.
+            let mut last_sent = false;
+            while let Some(speaking) = event_rx.recv().await {
+                let alive = this.update(cx, |shell, cx| {
+                    let Some(active) = shell.call.as_mut().filter(|active| active.channel.id == channel_id)
+                    else {
+                        return false;
+                    };
+                    let server_id = active.server_id;
+                    let ChannelStatus::Connected(call) = &mut active.status else { return false };
+                    let audible = speaking && !call.muted;
+                    if call.self_speaking != audible {
+                        call.self_speaking = audible;
+                        call.remote_surface.update(cx, |surface, cx| {
+                            surface.speaking = audible;
+                            cx.notify();
+                        });
+                        cx.notify();
+                    }
+                    if audible || last_sent {
+                        let author = shell.my_name();
+                        shell.send_room(
+                            server_id,
+                            ChatPayload::Speaking { channel: channel_id, author, speaking: audible },
+                            None,
+                        );
+                        last_sent = audible;
+                    }
+                    true
+                });
+                if !alive.unwrap_or(false) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The one place mute actually changes: flag, media-task switch, own
+    /// ring, and the room's view of it move together — every path that
+    /// flips mute (the buttons, deafen's implied mute, push-to-talk's
+    /// press/release) funnels through here so none of them can desync.
+    fn set_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
+        let Some(call) = self.connected_call_mut() else { return };
+        if call.muted == muted {
+            return;
         }
+        call.muted = muted;
+        let _ = call.mute.send(muted);
+        // Sync ring read: unmuting mid-sentence lights up immediately
+        // instead of waiting for the detector's next off→on edge.
+        let audible = !muted && *call.speaking_rx.borrow();
+        call.self_speaking = audible;
+        let surface = call.remote_surface.clone();
+        surface.update(cx, |surface, cx| {
+            surface.speaking = audible;
+            cx.notify();
+        });
+        let Some(active) = self.call.as_ref() else { return };
+        let (server_id, channel) = (active.server_id, active.channel.id);
+        let author = self.my_name();
+        self.send_room(server_id, ChatPayload::Speaking { channel, author, speaking: audible }, None);
+        cx.notify();
+    }
+
+    fn toggle_mute_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(call) = self.connected_call_mut() else { return };
+        let muted = !call.muted;
+        self.set_muted(muted, cx);
+    }
+
+    /// Deafen implies mute (you shouldn't be audible while you can't hear
+    /// anyone); undeafen restores whatever mute state preceded it.
+    fn toggle_deafen_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(call) = self.connected_call_mut() else { return };
+        if call.deafened {
+            call.deafened = false;
+            let _ = call.deafen.send(false);
+            let restore = call.muted_before_deafen;
+            self.set_muted(restore, cx);
+        } else {
+            call.deafened = true;
+            let _ = call.deafen.send(true);
+            call.muted_before_deafen = call.muted;
+            self.set_muted(true, cx);
+        }
+        // `set_muted` no-ops (including its notify) when mute didn't
+        // actually change, but the deafen flag always did.
+        cx.notify();
+    }
+
+    /// Push-to-talk on ⇒ the mic idles muted and Space unmutes while held
+    /// (see [`Shell::root_key_down`]/[`Shell::root_key_up`]); off ⇒ back to
+    /// open mic. In-window only — global hotkeys are OS-specific and out of
+    /// scope, which the toggle's tooltip says honestly.
+    fn toggle_ptt_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(call) = self.connected_call_mut() else { return };
+        call.ptt_enabled = !call.ptt_enabled;
+        let idle_muted = call.ptt_enabled;
+        self.set_muted(idle_muted, cx);
+        cx.notify();
+    }
+
+    /// Whether any of the app's text inputs has keyboard focus — the guard
+    /// that keeps push-to-talk's Space from firing while typing a message
+    /// (or a server name, or a switcher query...).
+    fn text_input_focused(&self, window: &Window, cx: &App) -> bool {
+        let mut inputs = vec![
+            &self.message_input,
+            &self.server_name_input,
+            &self.join_link_input,
+            &self.switcher_input,
+            &self.profile_form.name_input,
+            &self.profile_form.bio_input,
+        ];
+        if let Some((_, input)) = &self.editing {
+            inputs.push(input);
+        }
+        inputs.iter().any(|input| input.focus_handle(cx).is_focused(window))
     }
 
     fn dismiss_error_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2155,11 +2412,14 @@ impl Shell {
         });
         let in_call = matches!(&self.call, Some(ActiveCall { status: ChannelStatus::Connected(_), .. }));
         let connecting = matches!(&self.call, Some(ActiveCall { status: ChannelStatus::Connecting, .. }));
-        let (self_muted, self_sharing) = match &self.call {
-            Some(ActiveCall { status: ChannelStatus::Connected(call), .. }) => {
-                (call.muted, matches!(call.sharing, SharingState::Active(_)))
-            }
-            _ => (false, false),
+        let (self_muted, self_deafened, self_speaking, self_sharing) = match &self.call {
+            Some(ActiveCall { status: ChannelStatus::Connected(call), .. }) => (
+                call.muted,
+                call.deafened,
+                call.self_speaking,
+                matches!(call.sharing, SharingState::Active(_)),
+            ),
+            _ => (false, false, false, false),
         };
         let connected_channel_id = self
             .call
@@ -2312,6 +2572,17 @@ impl Shell {
             })
             .collect::<Vec<_>>();
 
+        // Remote members currently talking, per voice channel — the only
+        // presence the app has for other people in voice (no roster
+        // exchange yet), so rows appear while they speak and age out after.
+        let mut remote_speakers: HashMap<Uuid, Vec<String>> = HashMap::new();
+        for (channel_id, author) in self.speaking.keys() {
+            remote_speakers.entry(*channel_id).or_default().push(author.clone());
+        }
+        for speakers in remote_speakers.values_mut() {
+            speakers.sort();
+        }
+
         let voice_rows = server
             .link
             .channels
@@ -2373,7 +2644,12 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(theme::avatar(profile.avatar_path.clone(), profile.initial(), px(20.)))
+                        .child(speaking_avatar(
+                            profile.avatar_path.clone(),
+                            profile.initial().into(),
+                            20.,
+                            self_speaking,
+                        ))
                         .child(
                             div()
                                 .flex_1()
@@ -2385,8 +2661,11 @@ impl Shell {
                                 .text_color(if connecting { theme::faint_foreground() } else { theme::foreground() })
                                 .child(if connecting { "Connecting…".to_string() } else { profile.name.clone() }),
                         )
+                        .children(self_deafened.then(|| {
+                            theme::icon(icons::HEADPHONE_OFF, px(14.)).text_color(theme::destructive_foreground())
+                        }))
                         .children(
-                            self_muted
+                            (self_muted && !self_deafened)
                                 .then(|| theme::icon(icons::MIC_OFF, px(14.)).text_color(theme::destructive_foreground())),
                         )
                         .children(
@@ -2394,7 +2673,35 @@ impl Shell {
                         )
                 });
 
-                div().flex().flex_col().child(row).children(participant)
+                // Whoever else is audibly talking in this channel right now
+                // (rows come and go with their voice — see remote_speakers).
+                let speakers = remote_speakers.get(&channel.id).cloned().unwrap_or_default();
+                let speaker_rows = speakers.into_iter().map(|name| {
+                    let initial: SharedString =
+                        name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default().into();
+                    div()
+                        .mx(px(8.))
+                        .pl(px(26.))
+                        .pr(px(8.))
+                        .py(px(3.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(speaking_avatar(None, initial, 20., true))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(13.))
+                                .text_color(theme::foreground())
+                                .child(name),
+                        )
+                });
+
+                div().flex().flex_col().child(row).children(participant).children(speaker_rows)
             })
             .collect::<Vec<_>>();
 
@@ -2496,6 +2803,40 @@ impl Shell {
                 )
         });
 
+        let deafen_button = in_call.then(|| {
+            div()
+                .id("footer-deafen")
+                .size(px(32.))
+                .rounded_md()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when(self_deafened, |style| {
+                    style.bg(theme::destructive()).text_color(theme::primary_foreground())
+                })
+                .when(!self_deafened, |style| style.text_color(theme::muted_foreground()))
+                .hover(move |style| {
+                    if self_deafened {
+                        style.opacity(0.9)
+                    } else {
+                        style.bg(theme::wash()).text_color(theme::foreground())
+                    }
+                })
+                .active(|style| style.opacity(0.8))
+                .tooltip(theme::tooltip(if self_deafened { "Undeafen" } else { "Deafen" }))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_deafen_clicked))
+                .child(
+                    theme::icon(if self_deafened { icons::HEADPHONE_OFF } else { icons::HEADPHONES }, px(18.))
+                        .text_color(if self_deafened {
+                            theme::primary_foreground()
+                        } else {
+                            theme::muted_foreground()
+                        }),
+                )
+        });
+
         // The persistent user footer, on the darkest surface so it reads as
         // chrome: who you are, whether you're audible, and the way out.
         let footer = div()
@@ -2540,7 +2881,9 @@ impl Shell {
                     )
                     .child(
                         div().text_size(px(11.)).text_color(theme::muted_foreground()).child(
-                            if self_muted {
+                            if self_deafened {
+                                "Deafened"
+                            } else if self_muted {
                                 "Muted"
                             } else if in_call {
                                 "In voice"
@@ -2551,6 +2894,7 @@ impl Shell {
                     ),
             )
             .children(mute_button)
+            .children(deafen_button)
             .child(
                 theme::icon_button("footer-leave-server", icons::LOG_OUT, "Leave Server")
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::leave_server_clicked)),
@@ -3167,6 +3511,7 @@ impl Shell {
                         profile.initial(),
                         profile.name.clone(),
                         "Connecting to voice…",
+                        false,
                     )
                     .with_animation(
                         "connecting-pulse",
@@ -3248,6 +3593,8 @@ impl Shell {
         let control_bar = match status {
             Some(ChannelStatus::Connected(call)) => {
                 let muted = call.muted;
+                let deafened = call.deafened;
+                let ptt_enabled = call.ptt_enabled;
                 let (sharing_active, sharing_pending) = match call.sharing {
                     SharingState::Idle => (false, false),
                     SharingState::Pending => (false, true),
@@ -3267,6 +3614,43 @@ impl Shell {
                     false,
                 )
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_mute_clicked));
+
+                let deafen_btn = call_button(
+                    "call-deafen",
+                    if deafened { icons::HEADPHONE_OFF } else { icons::HEADPHONES },
+                    if deafened { "Undeafen" } else { "Deafen" },
+                    if deafened { theme::destructive() } else { theme::wash_strong() },
+                    false,
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_deafen_clicked));
+
+                // Push-to-talk is a mode, not a momentary action, so it gets a
+                // text pill instead of an icon: "PTT" lit primary while armed.
+                // Honest tooltip — the Space hold only works while the corcel
+                // window itself has keyboard focus.
+                let ptt_btn = div()
+                    .id("call-ptt")
+                    .h(px(44.))
+                    .px(px(16.))
+                    .rounded_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if ptt_enabled { theme::primary() } else { theme::wash_strong() })
+                    .text_color(theme::primary_foreground())
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.9))
+                    .active(|style| style.opacity(0.8))
+                    .tooltip(theme::tooltip(if ptt_enabled {
+                        "Push to talk is on: hold Space to speak (while the corcel window is focused). Click to switch back to open mic."
+                    } else {
+                        "Push to talk: mute the mic and hold Space to speak — works while the corcel window is focused."
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_ptt_clicked))
+                    .child("PTT");
 
                 let camera_btn = call_button(
                     "call-camera",
@@ -3360,8 +3744,10 @@ impl Shell {
                                 .border_color(theme::border())
                                 .shadow_lg()
                                 .child(mute_btn)
+                                .child(deafen_btn)
                                 .child(camera_btn)
                                 .child(share_btn)
+                                .child(ptt_btn)
                                 .child(div().w(px(1.)).h(px(28.)).bg(theme::input_border()))
                                 .child(leave_btn),
                         ),
@@ -3425,20 +3811,34 @@ impl Shell {
     }
 }
 
-/// A participant tile for the stage's audio-only states: avatar, name, and
-/// a one-line caption saying what's (not) happening.
+/// A voice participant's avatar with the green "I'm audible" ring. The
+/// ring is always drawn — transparent when quiet — so speech starting and
+/// stopping never shifts the layout around it.
+fn speaking_avatar(avatar: Option<PathBuf>, initial: SharedString, diameter: f32, speaking: bool) -> Div {
+    div()
+        .rounded_full()
+        .flex_none()
+        .border_2()
+        .border_color(if speaking { theme::success().into() } else { gpui::transparent_black() })
+        .child(theme::avatar(avatar, initial, px(diameter)))
+}
+
+/// A participant tile for the stage's audio-only states: avatar (ringed
+/// while speaking), name, and a one-line caption saying what's (not)
+/// happening.
 fn stage_tile(
     avatar: Option<PathBuf>,
     initial: impl Into<SharedString>,
     name: impl Into<SharedString>,
     caption: impl Into<SharedString>,
+    speaking: bool,
 ) -> Div {
     div()
         .flex()
         .flex_col()
         .items_center()
         .gap(px(12.))
-        .child(theme::avatar(avatar, initial.into(), px(80.)))
+        .child(speaking_avatar(avatar, initial.into(), 80., speaking))
         .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(theme::foreground()).child(name.into()))
         .child(div().text_size(px(12.5)).text_color(theme::muted_foreground()).child(caption.into()))
 }
@@ -3559,6 +3959,7 @@ impl Render for Shell {
             .size_full()
             .relative()
             .on_key_down(cx.listener(Self::root_key_down))
+            .on_key_up(cx.listener(Self::root_key_up))
             .child(content)
             .children(modal)
             .children(switcher)

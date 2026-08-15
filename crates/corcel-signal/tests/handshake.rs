@@ -5,7 +5,9 @@ use corcel_signal::{ClientMessage, ServerMessage, SignalPayload};
 #[tokio::test]
 async fn host_and_participant_exchange_a_signal() {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let relay = corcel_signal::relay::spawn(bind)
+    let identity =
+        corcel_signal::RelayIdentity::generate().expect("identity should generate");
+    let relay = corcel_signal::relay::spawn(bind, &identity)
         .await
         .expect("relay should start");
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay.port);
