@@ -121,7 +121,7 @@ impl Shell {
     /// remembers successes *and* failures for the app's lifetime; images are
     /// downscaled at decode (see [`MAX_DECODE_DIMENSION`]) to keep that
     /// affordable.
-    fn ensure_image_embed(&mut self, url: &str, cx: &mut Context<Self>) {
+    pub(super) fn ensure_image_embed(&mut self, url: &str, cx: &mut Context<Self>) {
         if self.image_embeds.contains_key(url) {
             return;
         }

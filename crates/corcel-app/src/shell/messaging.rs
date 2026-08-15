@@ -676,10 +676,20 @@ impl Shell {
         if body.is_empty() {
             return;
         }
-        let (server_id, channel_id) = match &self.screen {
-            Screen::Server { id, view: ServerView::Text { channel } } => (*id, channel.id),
-            _ => return,
-        };
+        let reply_to = self.replying_to.take().map(|original| original.id);
+        self.send_message_with(body, reply_to, cx);
+        self.message_input.update(cx, |input, cx| input.clear(cx));
+    }
+
+    /// Sends `body` as this user in the on-screen channel — the shared
+    /// tail of the composer, the GIF picker, and anything else that
+    /// produces a message.
+    pub(super) fn send_message_body(&mut self, body: String, cx: &mut Context<Self>) {
+        self.send_message_with(body, None, cx);
+    }
+
+    fn send_message_with(&mut self, body: String, reply_to: Option<Uuid>, cx: &mut Context<Self>) {
+        let Some((server_id, channel_id)) = self.visible_text_channel() else { return };
         let author = self.profile.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "?".to_string());
         let message = ChatMessage {
             id: Uuid::new_v4(),
@@ -687,7 +697,7 @@ impl Shell {
             author,
             sent_at: chat::now_millis(),
             body,
-            reply_to: self.replying_to.take().map(|original| original.id),
+            reply_to,
             edited_at: None,
             deleted: false,
             thread_root: None,
@@ -704,7 +714,6 @@ impl Shell {
         // The sent message supersedes "…is typing"; the next keystroke of a
         // new draft should announce immediately again.
         self.last_typing_sent = None;
-        self.message_input.update(cx, |input, cx| input.clear(cx));
         self.chat_scroll.scroll_to_bottom();
         cx.notify();
     }
@@ -1683,7 +1692,31 @@ impl Shell {
                     shell.maybe_send_typing(cx);
                 }
             }))
-            .child(self.message_input.clone());
+            .child(
+                div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(self.message_input.clone())).child(
+                    div()
+                        .id("gif-picker-button")
+                        .flex_none()
+                        .px(px(10.))
+                        .py(px(8.))
+                        .rounded(px(9.))
+                        .bg(if self.gif_picker_open { theme::wash_strong() } else { theme::wash() })
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::muted_foreground())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::wash_strong()).text_color(theme::foreground()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _, _window, cx| shell.toggle_gif_picker(cx)),
+                        )
+                        .child("GIF"),
+                ),
+            );
+
+        let gif_panel = self.gif_picker_open.then(|| self.render_gif_picker(cx));
 
         let chat_column = div()
             .flex_1()
@@ -1696,6 +1729,7 @@ impl Shell {
             .child(typing_strip)
             .children(reply_bar)
             .children(mention_popup)
+            .children(gif_panel)
             .child(composer);
 
         // The thread panel takes the member panel's slot while open —

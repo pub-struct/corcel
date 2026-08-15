@@ -9,6 +9,7 @@
 mod call;
 mod context_menu;
 mod embeds;
+mod gifs;
 mod messaging;
 mod onboarding;
 mod switcher;
@@ -44,6 +45,7 @@ use crate::{richtext, runtime};
 use call::{speaking_avatar, stage_tile};
 use context_menu::{ContextAction, ContextMenu, ContextMenuItem};
 use embeds::{ImageEmbed, VideoEmbed};
+use gifs::GifResult;
 
 /// How long a remote peer's speaking ring survives without a fresh
 /// `Speaking { true }`. Transitions are explicit (unlike typing, silence
@@ -446,6 +448,12 @@ pub(crate) struct Shell {
     thread_counts: HashMap<Uuid, (u32, i64)>,
     /// The thread panel's composer.
     thread_input: Entity<TextInput>,
+    /// The composer's GIF picker (see [`gifs`]).
+    gif_picker_open: bool,
+    gif_input: Entity<TextInput>,
+    gif_results: Vec<GifResult>,
+    gif_loading: bool,
+    gif_error: Option<String>,
     /// The open right-click menu, if any (see [`context_menu`]).
     context_menu: Option<ContextMenu>,
     /// Which row of the composer's @mention autocomplete is highlighted.
@@ -525,6 +533,11 @@ impl Shell {
             thread_input: cx.new(|cx| TextInput::new("Reply in thread…", cx)),
             mention_selected: 0,
             context_menu: None,
+            gif_picker_open: false,
+            gif_input: cx.new(|cx| TextInput::new("Search Tenor…", cx)),
+            gif_results: Vec::new(),
+            gif_loading: false,
+            gif_error: None,
             reacting_to: None,
             chat_reactions: HashMap::new(),
             image_embeds: HashMap::new(),
@@ -726,6 +739,9 @@ impl Shell {
             if key == "escape" {
                 if self.context_menu.is_some() {
                     self.close_context_menu(cx);
+                } else if self.gif_picker_open {
+                    self.gif_picker_open = false;
+                    cx.notify();
                 } else if self.edit_profile_open {
                     self.edit_profile_open = false;
                     cx.notify();
