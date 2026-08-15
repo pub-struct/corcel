@@ -1,0 +1,248 @@
+//! The host side of a channel's ephemeral wss:// signaling relay.
+//!
+//! When a peer starts hosting a server, it spawns one of these locally. It
+//! knows nothing about SDP/ICE semantics — it just routes opaque
+//! [`SignalPayload`](crate::protocol::SignalPayload)s between the host and
+//! whichever participants are currently signaling for a given channel, and
+//! gets out of the way once each pair has what it needs to connect directly.
+//!
+//! TLS uses a self-signed certificate generated fresh per process; the
+//! fingerprint is meant to travel inside the invite link so joining clients
+//! can pin against it (see [`crate::client`]) instead of trusting a CA.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use futures_util::{SinkExt, StreamExt};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sha2::{Digest, Sha256};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
+
+use crate::protocol::{ChannelId, ClientMessage, PeerId, ServerMessage};
+
+pub struct Relay {
+    pub port: u16,
+    pub fingerprint: [u8; 32],
+}
+
+#[derive(Default)]
+struct ChannelState {
+    host: Option<(PeerId, mpsc::UnboundedSender<ServerMessage>)>,
+    participants: HashMap<PeerId, mpsc::UnboundedSender<ServerMessage>>,
+    /// Connections observing this channel's occupant count via
+    /// [`ClientMessage::Watch`] — never counted as occupants themselves, and
+    /// never targets of [`ChannelState::broadcast_except`].
+    watchers: HashMap<PeerId, mpsc::UnboundedSender<ServerMessage>>,
+}
+
+impl ChannelState {
+    fn sender_for(&self, peer: PeerId) -> Option<mpsc::UnboundedSender<ServerMessage>> {
+        if let Some((host_id, tx)) = &self.host {
+            if *host_id == peer {
+                return Some(tx.clone());
+            }
+        }
+        self.participants.get(&peer).cloned()
+    }
+
+    fn broadcast_except(&self, except: PeerId, msg: &ServerMessage) {
+        if let Some((host_id, tx)) = &self.host {
+            if *host_id != except {
+                let _ = tx.send(msg.clone());
+            }
+        }
+        for (id, tx) in &self.participants {
+            if *id != except {
+                let _ = tx.send(msg.clone());
+            }
+        }
+    }
+
+    /// Occupants only — watchers don't count toward "who's in the call".
+    fn occupant_count(&self) -> usize {
+        self.host.is_some() as usize + self.participants.len()
+    }
+
+    fn notify_watchers(&self) {
+        let msg = ServerMessage::Presence { count: self.occupant_count() };
+        for tx in self.watchers.values() {
+            let _ = tx.send(msg.clone());
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.host.is_none() && self.participants.is_empty() && self.watchers.is_empty()
+    }
+}
+
+type Channels = Arc<Mutex<HashMap<ChannelId, ChannelState>>>;
+
+/// Binds a local listener, generates a fresh self-signed cert, and starts
+/// accepting wss connections in the background. The task runs for the
+/// lifetime of the process — there's no shutdown handle yet, which is fine
+/// for a relay whose whole reason to exist is "as long as the host's app is
+/// open."
+pub async fn spawn(bind_addr: SocketAddr) -> anyhow::Result<Relay> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["freecord-host".to_string()])?;
+    let cert_der: CertificateDer<'static> = cert.der().clone();
+    let fingerprint: [u8; 32] = Sha256::digest(cert_der.as_ref()).into();
+    let key_der: PrivateKeyDer<'static> =
+        PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind(bind_addr).await?;
+    let port = listener.local_addr()?.port();
+
+    let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer_addr)) = listener.accept().await else {
+                continue;
+            };
+            let acceptor = acceptor.clone();
+            let channels = channels.clone();
+            tokio::spawn(async move {
+                if let Err(err) = handle_connection(stream, acceptor, channels).await {
+                    tracing_stub_log(&err);
+                }
+            });
+        }
+    });
+
+    Ok(Relay { port, fingerprint })
+}
+
+// Small placeholder so we're not silently swallowing connection errors
+// before a real logging story exists.
+fn tracing_stub_log(err: &anyhow::Error) {
+    eprintln!("freecord-signal: connection error: {err:#}");
+}
+
+async fn handle_connection(
+    tcp: TcpStream,
+    acceptor: TlsAcceptor,
+    channels: Channels,
+) -> anyhow::Result<()> {
+    let tls = acceptor.accept(tcp).await?;
+    let ws = tokio_tungstenite::accept_async(tls).await?;
+    let (mut outgoing, mut incoming) = ws.split();
+
+    let first = match incoming.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => return Ok(()), // client vanished before saying hello
+    };
+    let (channel_id, peer_id, is_host) = match serde_json::from_str::<ClientMessage>(&first)? {
+        ClientMessage::Host { channel } => (channel, Uuid::new_v4(), true),
+        ClientMessage::Join { channel } => (channel, Uuid::new_v4(), false),
+        ClientMessage::Relay { .. } => {
+            let _ = send(&mut outgoing, &ServerMessage::Error {
+                message: "expected Host or Join as the first message".into(),
+            })
+            .await;
+            return Ok(());
+        }
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+    {
+        let mut channels = channels.lock().unwrap();
+        let state = channels.entry(channel_id).or_default();
+        if is_host {
+            if state.host.is_some() {
+                let _ = tx.send(ServerMessage::Error {
+                    message: "channel already has a host".into(),
+                });
+            } else {
+                state.host = Some((peer_id, tx.clone()));
+            }
+        } else if state.host.is_none() {
+            let _ = tx.send(ServerMessage::Error {
+                message: "channel has no host yet".into(),
+            });
+        } else {
+            state.participants.insert(peer_id, tx.clone());
+            state.broadcast_except(peer_id, &ServerMessage::PeerJoined { peer: peer_id });
+        }
+        let host_id = state.host.as_ref().map(|(id, _)| *id);
+        let _ = tx.send(ServerMessage::Welcome {
+            your_peer: peer_id,
+            host: host_id,
+        });
+    }
+
+    // Forward the per-connection outbound queue to the actual socket.
+    let forward = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if send(&mut outgoing, &msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(msg) = incoming.next().await {
+        let Ok(Message::Text(text)) = msg else { break };
+        let Ok(ClientMessage::Relay { to, payload }) = serde_json::from_str(&text) else {
+            continue;
+        };
+        let target = channels.lock().unwrap().get(&channel_id).and_then(|s| s.sender_for(to));
+        if let Some(target) = target {
+            let _ = target.send(ServerMessage::Relay { from: peer_id, payload });
+        }
+    }
+
+    // Connection closed: tear down this peer's membership and let the rest
+    // of the channel know. Derived from actual membership (not the `is_host`
+    // this connection *asked* for above) — a connection whose Host claim was
+    // rejected because the channel already had one never became host or a
+    // participant, and clearing `state.host` based on its stale intent would
+    // evict the real host from under it, breaking the channel for everyone.
+    {
+        let mut channels = channels.lock().unwrap();
+        if let Some(state) = channels.get_mut(&channel_id) {
+            let was_host = state.host.as_ref().is_some_and(|(id, _)| *id == peer_id);
+            let was_participant = if was_host {
+                false
+            } else {
+                state.participants.remove(&peer_id).is_some()
+            };
+            if was_host {
+                state.host = None;
+            }
+            if was_host || was_participant {
+                state.broadcast_except(peer_id, &ServerMessage::PeerLeft { peer: peer_id });
+            }
+            if state.host.is_none() && state.participants.is_empty() {
+                channels.remove(&channel_id);
+            }
+        }
+    }
+    forward.abort();
+
+    Ok(())
+}
+
+async fn send(
+    outgoing: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>,
+        Message,
+    >,
+    msg: &ServerMessage,
+) -> anyhow::Result<()> {
+    let text = serde_json::to_string(msg)?;
+    outgoing.send(Message::Text(text.into())).await?;
+    Ok(())
+}

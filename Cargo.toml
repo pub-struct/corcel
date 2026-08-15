@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/freecord-app",
+    "crates/freecord-signal",
+    "crates/freecord-net",
+    "crates/freecord-media",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[profile.dev]
+# Full debug builds of gpui/gstreamer dependency trees are slow to iterate on;
+# keep opt-level low for our own crates but let dependencies build reasonably.
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
