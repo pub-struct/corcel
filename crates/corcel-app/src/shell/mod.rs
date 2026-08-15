@@ -133,6 +133,10 @@ struct ConnectedCall {
     pc: corcel_net::CallHandle,
     remote_surface: Entity<VideoSurface>,
     sharing: SharingState,
+    /// Whether the quality picker (720p/1080p/2K) is open above the share
+    /// button — sharing starts from one of its options, not from the
+    /// button itself.
+    share_quality_menu: bool,
     camera: CameraState,
     /// Mirror of the value last sent through `mute`, kept here because the
     /// UI needs a synchronous read every render and `watch::Sender::borrow`

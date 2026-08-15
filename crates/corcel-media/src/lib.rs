@@ -16,7 +16,7 @@ pub mod capture;
 pub mod playback;
 pub mod player;
 
-pub use capture::Capture;
+pub use capture::{Capture, ScreenShareQuality};
 pub use playback::{AudioPlayback, VideoFrame, VideoPlayback};
 pub use player::{PlayerEvent, UrlPlayer};
 

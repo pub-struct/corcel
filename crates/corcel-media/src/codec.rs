@@ -21,13 +21,48 @@ fn find(candidates: &[&'static str]) -> anyhow::Result<&'static str> {
 /// vendor blocks (NVENC/QuickSync/AMF) on Windows with Media Foundation
 /// as the always-present catch-all — the same "hardware or bust" policy
 /// everywhere (MF itself fronts whatever encoder MFT the machine has).
-pub fn h264_encoder() -> anyhow::Result<&'static str> {
+///
+/// Returned with its streaming properties baked in, keyed to whichever
+/// element was found. The non-negotiable one is a bounded keyframe
+/// interval: corcel has no PLI/FIR path asking the encoder for a refresh,
+/// so a receiver that joins (or loses packets) can only recover at the
+/// next periodic keyframe. Encoders left at their defaults may emit
+/// exactly one IDR ever on near-static content (VideoToolbox does on
+/// screen capture), which turns "joined after frame 0" into a permanently
+/// black stream.
+///
+/// `bitrate_kbps` is an explicit target, not a hint: every encoder here
+/// defaults to either "auto" or ~2Mbps, both of which pick call-quality
+/// rates (VideoToolbox auto lands at ~1Mbps for a 1920x1200 screen) that
+/// smear text into mush the moment anything moves. Every element listed
+/// takes a `bitrate` property in kbps.
+pub fn h264_encoder(bitrate_kbps: u32) -> anyhow::Result<String> {
+    // ~2s at 30fps; on macOS the frame-count and duration caps back each
+    // other up. `realtime` favors encode latency over compression, and
+    // `allow-frame-reordering=false` disables B-frames — vtenc emits them
+    // by default, and RTP receivers shouldn't pay the reorder latency for
+    // a live stream.
     #[cfg(target_os = "macos")]
-    return find(&["vtenc_h264_hw", "vtenc_h264"]);
+    {
+        let name = find(&["vtenc_h264_hw", "vtenc_h264"])?;
+        Ok(format!(
+            "{name} realtime=true allow-frame-reordering=false bitrate={bitrate_kbps} \
+             max-keyframe-interval=60 max-keyframe-interval-duration=2000000000"
+        ))
+    }
     #[cfg(target_os = "windows")]
-    return find(&["nvh264enc", "qsvh264enc", "amfh264enc", "mfh264enc"]);
+    {
+        let name = find(&["nvh264enc", "qsvh264enc", "amfh264enc", "mfh264enc"])?;
+        Ok(format!("{name} gop-size=60 bitrate={bitrate_kbps}"))
+    }
     #[cfg(target_os = "linux")]
-    find(&["vah264enc", "vaapih264enc"])
+    {
+        let name = find(&["vah264enc", "vaapih264enc"])?;
+        Ok(match name {
+            "vah264enc" => format!("{name} key-int-max=60 bitrate={bitrate_kbps}"),
+            _ => format!("{name} keyframe-period=60 bitrate={bitrate_kbps}"),
+        })
+    }
 }
 
 pub fn h264_decoder() -> anyhow::Result<&'static str> {

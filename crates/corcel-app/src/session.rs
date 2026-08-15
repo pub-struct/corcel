@@ -351,8 +351,9 @@ pub async fn start_camera(
 pub async fn start_screen_share(
     pc: CallHandle,
     preview: mpsc::Sender<corcel_media::VideoFrame>,
+    quality: corcel_media::ScreenShareQuality,
 ) -> anyhow::Result<ScreenShareHandle> {
-    let mut capture = corcel_media::capture::screen().await?;
+    let mut capture = corcel_media::capture::screen(quality).await?;
     let outgoing = corcel_net::publish_video_track(&pc);
     let mut playback = corcel_media::VideoPlayback::new()?;
 

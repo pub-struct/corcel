@@ -11,6 +11,7 @@ use std::future::Future;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 
+#[cfg(target_os = "linux")]
 use anyhow::Context;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
@@ -68,12 +69,15 @@ impl Drop for Capture {
     }
 }
 
-/// Bound applied to every capture's outgoing packet channel: real-time RTP
-/// tolerates loss far better than unbounded memory growth, so a stalled
-/// consumer (e.g. the network write side backpressuring) drops packets
-/// instead of buffering them indefinitely. Small multiple of typical
-/// jitter, generous for packets this size (~1200B MTU).
-const PACKET_CHANNEL_CAPACITY: usize = 32;
+/// Bound applied to every capture's outgoing packet channel. Sized for the
+/// burstiest legitimate producer: a single H264 keyframe is one *frame* but
+/// hundreds of RTP packets (a 1080p screen-share IDR is ~250KB → ~200+
+/// packets at 1200B MTU), and the pump must never lose part of one — a
+/// truncated keyframe corrupts the decoded picture until the next one.
+/// The pump blocks (rather than drops) when full, so this bound only
+/// limits memory (~1200B per slot); backpressure from a genuinely stalled
+/// consumer lands in the pipeline, not in silent mid-frame packet loss.
+const PACKET_CHANNEL_CAPACITY: usize = 512;
 
 fn start(
     label: &'static str,
@@ -110,11 +114,16 @@ fn pump_packets(label: &'static str, sink: AppSink) -> mpsc::Receiver<rtc::rtp::
                 continue;
             };
             match rtp::unmarshal(&map) {
-                Ok(packet) => match tx.try_send(packet) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                },
+                // Blocking, not `try_send`-and-drop: packets arrive in
+                // per-frame bursts, and dropping the tail of a keyframe
+                // burst (as an over-full channel would) corrupts the
+                // stream far worse than briefly backpressuring the
+                // pipeline. This thread exists to be blockable.
+                Ok(packet) => {
+                    if tx.blocking_send(packet).is_err() {
+                        break;
+                    }
+                }
                 Err(err) => {
                     eprintln!("corcel-media: {label}: failed to parse RTP packet: {err:#}")
                 }
@@ -122,6 +131,54 @@ fn pump_packets(label: &'static str, sink: AppSink) -> mpsc::Receiver<rtc::rtp::
         }
     });
     rx
+}
+
+/// Camera target bitrate: 720p30 natural video holds up fine at this rate.
+const CAMERA_BITRATE_KBPS: u32 = 2500;
+
+/// Quality preset the user picks before starting a screen share: an upper
+/// bound on the encoded resolution plus a matching target bitrate. Text
+/// and UI detail need far more bitrate than natural video — encoder
+/// "auto" picks ~1Mbps for a 1080p-class screen, which reads as "not
+/// enough bandwidth" blur even on a LAN — so each step up in resolution
+/// brings a proportionally higher target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenShareQuality {
+    /// 720p-class: cheapest, for weak uplinks.
+    Hd720,
+    /// 1080p-class: the sensible default.
+    Fhd1080,
+    /// 2K (1440p-class): sharpest, costs the most bandwidth.
+    Qhd1440,
+}
+
+impl ScreenShareQuality {
+    /// The bounding box the capture is downscaled to fit inside (aspect
+    /// preserved by videoscale/vapostproc fixation, never upscaled — the
+    /// caps ranges start at 16). Stated as 16:9 frames; 16:10 screens
+    /// fixate against the height (e.g. 1728x1080 inside the 1080p box).
+    fn max_size(self) -> (u32, u32) {
+        match self {
+            Self::Hd720 => (1280, 720),
+            Self::Fhd1080 => (1920, 1080),
+            Self::Qhd1440 => (2560, 1440),
+        }
+    }
+
+    fn bitrate_kbps(self) -> u32 {
+        match self {
+            Self::Hd720 => 4000,
+            Self::Fhd1080 => 8000,
+            Self::Qhd1440 => 14000,
+        }
+    }
+
+    /// The `video/x-raw,...` capsfilter enforcing [`Self::max_size`],
+    /// shared by every platform's screen pipeline.
+    fn caps(self) -> String {
+        let (w, h) = self.max_size();
+        format!("video/x-raw,width=(int)[16,{w}],height=(int)[16,{h}]")
+    }
 }
 
 /// Captures from a camera: a V4L2 device (e.g. `/dev/video0`) on Linux, or
@@ -147,7 +204,7 @@ pub fn camera(device: &str) -> anyhow::Result<Capture> {
          ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
          ! appsink name=sink emit-signals=false sync=false",
         postproc = codec::video_postproc()?,
-        encoder = codec::h264_encoder()?,
+        encoder = codec::h264_encoder(CAMERA_BITRATE_KBPS)?,
         pt = corcel_net::H264_PAYLOAD_TYPE,
     );
     start("camera", &description, Vec::new(), None)
@@ -271,14 +328,19 @@ fn watch_microphone_bus(gst_pipeline: &gstreamer::Pipeline) -> watch::Receiver<b
 /// whatever app launched corcel (e.g. Terminal); the share fails until
 /// that's granted and the app restarted.
 #[cfg(target_os = "macos")]
-pub async fn screen() -> anyhow::Result<Capture> {
+pub async fn screen(quality: ScreenShareQuality) -> anyhow::Result<Capture> {
+    // The quality caps downscale Retina-native capture (e.g. 2880x1800)
+    // before encoding; videoscale fixates within the range preserving
+    // aspect. Ranges rather than fixed values so a smaller screen passes
+    // through unscaled.
     let description = format!(
         "avfvideosrc capture-screen=true capture-screen-cursor=true ! video/x-raw \
-         ! {postproc} ! video/x-raw ! {encoder} \
+         ! {postproc} ! {caps} ! {encoder} \
          ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
          ! appsink name=sink emit-signals=false sync=false",
         postproc = codec::video_postproc()?,
-        encoder = codec::h264_encoder()?,
+        caps = quality.caps(),
+        encoder = codec::h264_encoder(quality.bitrate_kbps())?,
         pt = corcel_net::H264_PAYLOAD_TYPE,
     );
     start("screen share", &description, Vec::new(), None)
@@ -291,14 +353,15 @@ pub async fn screen() -> anyhow::Result<Capture> {
 /// before the software convert/scale front-end (see
 /// [`codec::video_postproc`]).
 #[cfg(target_os = "windows")]
-pub async fn screen() -> anyhow::Result<Capture> {
+pub async fn screen(quality: ScreenShareQuality) -> anyhow::Result<Capture> {
     let description = format!(
         "d3d11screencapturesrc show-cursor=true ! d3d11download ! video/x-raw \
-         ! {postproc} ! video/x-raw ! {encoder} \
+         ! {postproc} ! {caps} ! {encoder} \
          ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
          ! appsink name=sink emit-signals=false sync=false",
         postproc = codec::video_postproc()?,
-        encoder = codec::h264_encoder()?,
+        caps = quality.caps(),
+        encoder = codec::h264_encoder(quality.bitrate_kbps())?,
         pt = corcel_net::H264_PAYLOAD_TYPE,
     );
     start("screen share", &description, Vec::new(), None)
@@ -309,7 +372,7 @@ pub async fn screen() -> anyhow::Result<Capture> {
 /// then feeds the resulting PipeWire stream through the same H264 encode
 /// pipeline as [`camera`].
 #[cfg(target_os = "linux")]
-pub async fn screen() -> anyhow::Result<Capture> {
+pub async fn screen(quality: ScreenShareQuality) -> anyhow::Result<Capture> {
     use ashpd::desktop::PersistMode;
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 
@@ -365,12 +428,13 @@ pub async fn screen() -> anyhow::Result<Capture> {
     // compositor actually offers.
     let description = format!(
         "pipewiresrc fd={fd} path={node_id} do-timestamp=true always-copy=true ! video/x-raw \
-         ! {postproc} ! video/x-raw ! {encoder} \
+         ! {postproc} ! {caps} ! {encoder} \
          ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
          ! appsink name=sink emit-signals=false sync=false",
         fd = fd.as_raw_fd(),
         postproc = codec::video_postproc()?,
-        encoder = codec::h264_encoder()?,
+        caps = quality.caps(),
+        encoder = codec::h264_encoder(quality.bitrate_kbps())?,
         pt = corcel_net::H264_PAYLOAD_TYPE,
     );
 

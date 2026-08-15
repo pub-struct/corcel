@@ -91,6 +91,7 @@ impl Shell {
                     pc,
                     remote_surface: surface.clone(),
                     sharing: SharingState::Idle,
+                    share_quality_menu: false,
                     camera: CameraState::Idle,
                     muted: false,
                     mute,
@@ -335,10 +336,27 @@ impl Shell {
         cx.notify();
     }
 
+    /// The share button no longer starts the capture directly — it opens
+    /// the quality picker, and [`Self::start_screen_share`] runs when the
+    /// user picks 720p/1080p/2K from it.
     pub(super) fn share_screen_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(call) = self.connected_call_mut() else { return };
+        if !matches!(call.sharing, SharingState::Idle) {
+            return;
+        }
+        // Set, not toggled: when the menu is open, the click's mouse-down
+        // already closed it via the menu's `on_mouse_down_out` before this
+        // mouse-up handler runs — toggling here would just reopen it. The
+        // button opens; clicking anywhere else (including it) closes.
+        call.share_quality_menu = true;
+        cx.notify();
+    }
+
+    pub(super) fn start_screen_share(&mut self, quality: corcel_media::ScreenShareQuality, cx: &mut Context<Self>) {
         let Some(active) = self.call.as_mut() else { return };
         let channel_id = active.channel.id;
         let ChannelStatus::Connected(call) = &mut active.status else { return };
+        call.share_quality_menu = false;
         if !matches!(call.sharing, SharingState::Idle) {
             return;
         }
@@ -352,7 +370,7 @@ impl Shell {
         let pc = call.pc.clone();
         let preview = call.local_video.clone();
 
-        let rx = runtime::spawn_and_send(session::start_screen_share(pc, preview));
+        let rx = runtime::spawn_and_send(session::start_screen_share(pc, preview, quality));
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |shell, cx| {
@@ -736,13 +754,102 @@ impl Shell {
             _ => None,
         };
 
+        // The share-quality picker, floating just above the control bar.
+        // Only rendered while sharing is still idle — once a quality is
+        // picked (or the share is already running) it has nothing to offer.
+        let quality_menu = match status {
+            Some(ChannelStatus::Connected(call))
+                if call.share_quality_menu && matches!(call.sharing, SharingState::Idle) =>
+            {
+                let option = |id: &'static str,
+                              label: &'static str,
+                              hint: &'static str,
+                              quality: corcel_media::ScreenShareQuality,
+                              cx: &mut Context<Self>| {
+                    div()
+                        .id(id)
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded_lg()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(24.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::wash_strong()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _window, cx| {
+                                shell.start_screen_share(quality, cx);
+                            }),
+                        )
+                        .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child(label))
+                        .child(div().text_size(px(11.5)).text_color(theme::muted_foreground()).child(hint))
+                };
+                Some(
+                    div().absolute().bottom(px(84.)).left_0().right_0().flex().justify_center().child(
+                        div()
+                            .id("share-quality-menu")
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .p(px(6.))
+                            .rounded_xl()
+                            .bg(theme::popover())
+                            .border_1()
+                            .border_color(theme::border())
+                            .shadow_lg()
+                            .on_mouse_down_out(cx.listener(|shell, _, _window, cx| {
+                                if let Some(call) = shell.connected_call_mut() {
+                                    call.share_quality_menu = false;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .px(px(12.))
+                                    .pt(px(4.))
+                                    .pb(px(2.))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::muted_foreground())
+                                    .child("Share quality"),
+                            )
+                            .child(option(
+                                "share-quality-720",
+                                "720p",
+                                "Lightest — slow connections",
+                                corcel_media::ScreenShareQuality::Hd720,
+                                cx,
+                            ))
+                            .child(option(
+                                "share-quality-1080",
+                                "1080p",
+                                "Balanced — recommended",
+                                corcel_media::ScreenShareQuality::Fhd1080,
+                                cx,
+                            ))
+                            .child(option(
+                                "share-quality-2k",
+                                "2K",
+                                "Sharpest — most bandwidth",
+                                corcel_media::ScreenShareQuality::Qhd1440,
+                                cx,
+                            )),
+                    ),
+                )
+            }
+            _ => None,
+        };
+
         let stage = div()
             .flex_1()
             .min_h_0()
             .relative()
             .bg(theme::rail())
             .child(stage_content)
-            .children(control_bar);
+            .children(control_bar)
+            .children(quality_menu);
 
         div().flex_1().min_w_0().h_full().flex().flex_col().child(header).child(stage)
     }
