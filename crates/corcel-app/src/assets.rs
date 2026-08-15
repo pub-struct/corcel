@@ -19,8 +19,12 @@ pub mod icons {
     pub const MIC: &str = "icons/mic.svg";
     pub const MIC_OFF: &str = "icons/mic-off.svg";
     pub const MONITOR_UP: &str = "icons/monitor-up.svg";
+    pub const PENCIL: &str = "icons/pencil.svg";
     pub const PHONE: &str = "icons/phone.svg";
     pub const PLUS: &str = "icons/plus.svg";
+    pub const REPLY: &str = "icons/reply.svg";
+    pub const SMILE_PLUS: &str = "icons/smile-plus.svg";
+    pub const TRASH: &str = "icons/trash-2.svg";
     pub const USER: &str = "icons/user.svg";
     pub const USERS: &str = "icons/users.svg";
     pub const VIDEO: &str = "icons/video.svg";
@@ -36,8 +40,12 @@ const ASSETS: &[(&str, &[u8])] = &[
     (icons::MIC, include_bytes!("../assets/icons/mic.svg")),
     (icons::MIC_OFF, include_bytes!("../assets/icons/mic-off.svg")),
     (icons::MONITOR_UP, include_bytes!("../assets/icons/monitor-up.svg")),
+    (icons::PENCIL, include_bytes!("../assets/icons/pencil.svg")),
     (icons::PHONE, include_bytes!("../assets/icons/phone.svg")),
     (icons::PLUS, include_bytes!("../assets/icons/plus.svg")),
+    (icons::REPLY, include_bytes!("../assets/icons/reply.svg")),
+    (icons::SMILE_PLUS, include_bytes!("../assets/icons/smile-plus.svg")),
+    (icons::TRASH, include_bytes!("../assets/icons/trash-2.svg")),
     (icons::USER, include_bytes!("../assets/icons/user.svg")),
     (icons::USERS, include_bytes!("../assets/icons/users.svg")),
     (icons::VIDEO, include_bytes!("../assets/icons/video.svg")),

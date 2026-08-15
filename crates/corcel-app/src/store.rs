@@ -67,6 +67,20 @@ const MIGRATIONS: &[&str] = &[
         channel_id TEXT PRIMARY KEY,
         last_read  INTEGER NOT NULL
     );",
+    // 3: replicated message features — replies, edits, delete tombstones,
+    // and reactions. Ids are TEXT like every other id column here.
+    "ALTER TABLE messages ADD COLUMN reply_to TEXT;
+    ALTER TABLE messages ADD COLUMN edited_at INTEGER;
+    ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE reactions (
+        message_id TEXT NOT NULL,
+        emoji      TEXT NOT NULL,
+        author     TEXT NOT NULL,
+        at         INTEGER NOT NULL,
+        removed    INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (message_id, emoji, author)
+    );
+    CREATE INDEX reactions_by_time ON reactions (at);",
 ];
 
 impl Store {
@@ -166,13 +180,22 @@ impl Store {
         Ok(())
     }
 
-    /// Stores a message if it isn't already known. Returns whether it was
-    /// new — replication dedupes on this (`INSERT OR IGNORE` keyed on the
-    /// message's UUID), so re-receiving history is harmless.
+    /// Stores or merges a message, returning whether anything changed.
+    /// New ids insert; a known id merges by last-writer-wins on `edited_at`
+    /// (a newer edit replaces the body) and monotonically on `deleted` (a
+    /// tombstone never un-deletes). Re-receiving identical history is a
+    /// no-op, so replication stays idempotent.
     pub fn insert_message(&self, server_id: Uuid, message: &ChatMessage) -> anyhow::Result<bool> {
-        let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO messages (id, server_id, channel_id, author, sent_at, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let changed = self.conn.execute(
+            "INSERT INTO messages (id, server_id, channel_id, author, sent_at, body,
+                                   reply_to, edited_at, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                 body      = excluded.body,
+                 edited_at = excluded.edited_at,
+                 deleted   = MAX(messages.deleted, excluded.deleted)
+             WHERE COALESCE(excluded.edited_at, 0) > COALESCE(messages.edited_at, 0)
+                OR excluded.deleted > messages.deleted",
             params![
                 message.id.to_string(),
                 server_id.to_string(),
@@ -180,16 +203,112 @@ impl Store {
                 message.author,
                 message.sent_at,
                 message.body,
+                message.reply_to.map(|id| id.to_string()),
+                message.edited_at,
+                message.deleted,
             ],
         )?;
-        Ok(inserted > 0)
+        Ok(changed > 0)
+    }
+
+    /// Applies an edit if it's newer than what we have (last-writer-wins on
+    /// `edited_at`). Returns whether the row changed; an edit for an unknown
+    /// id changes nothing — backfill delivers the already-merged message.
+    pub fn apply_edit(&self, message_id: Uuid, body: &str, edited_at: i64) -> anyhow::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE messages SET body = ?2, edited_at = ?3
+             WHERE id = ?1 AND ?3 > COALESCE(edited_at, 0)",
+            params![message_id.to_string(), body, edited_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Sets a message's delete tombstone. Monotone: already-deleted rows
+    /// don't change (returns false), and nothing ever clears the flag.
+    pub fn apply_delete(&self, message_id: Uuid) -> anyhow::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE messages SET deleted = 1 WHERE id = ?1 AND deleted = 0",
+            params![message_id.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Merges one reaction state, newest `at` wins per `(message, emoji,
+    /// author)` key — so react/un-react/re-react converge no matter the
+    /// arrival order. Returns whether the stored state changed.
+    pub fn upsert_reaction(&self, reaction: &crate::chat::ReactionRow) -> anyhow::Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT INTO reactions (message_id, emoji, author, at, removed)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(message_id, emoji, author) DO UPDATE SET
+                 at = excluded.at,
+                 removed = excluded.removed
+             WHERE excluded.at > reactions.at",
+            params![
+                reaction.message_id.to_string(),
+                reaction.emoji,
+                reaction.author,
+                reaction.at,
+                reaction.removed,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Every live (non-removed) reaction on a channel's messages, oldest
+    /// first — the order chips appear in under a message.
+    pub fn reactions_for(&self, channel: ChannelId) -> anyhow::Result<Vec<(Uuid, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.message_id, r.emoji, r.author
+             FROM reactions r JOIN messages m ON m.id = r.message_id
+             WHERE m.channel_id = ?1 AND r.removed = 0
+             ORDER BY r.at, r.emoji",
+        )?;
+        let rows = stmt.query_map(params![channel.to_string()], |row| {
+            let message_id: String = row.get(0)?;
+            Ok((message_id, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        Ok(rows
+            .filter_map(|row| row.ok())
+            .filter_map(|(id, emoji, author)| Some((id.parse().ok()?, emoji, author)))
+            .collect())
+    }
+
+    /// Every reaction change (removals included — they're tombstones that
+    /// must replicate) on a server's messages newer than `since`, for
+    /// answering a history request.
+    pub fn reactions_since(&self, server_id: Uuid, since: i64) -> anyhow::Result<Vec<crate::chat::ReactionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.message_id, m.channel_id, r.emoji, r.author, r.at, r.removed
+             FROM reactions r JOIN messages m ON m.id = r.message_id
+             WHERE m.server_id = ?1 AND r.at > ?2
+             ORDER BY r.at",
+        )?;
+        let rows = stmt.query_map(params![server_id.to_string(), since], |row| {
+            let message_id: String = row.get(0)?;
+            let channel: String = row.get(1)?;
+            Ok((message_id, channel, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, bool>(5)?))
+        })?;
+        Ok(rows
+            .filter_map(|row| row.ok())
+            .filter_map(|(message_id, channel, emoji, author, at, removed)| {
+                Some(crate::chat::ReactionRow {
+                    message_id: message_id.parse().ok()?,
+                    channel: channel.parse().ok()?,
+                    emoji,
+                    author,
+                    at,
+                    removed,
+                })
+            })
+            .collect())
     }
 
     /// A channel's messages in display order.
     pub fn messages(&self, channel: ChannelId) -> anyhow::Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel_id, author, sent_at, body FROM messages
-             WHERE channel_id = ?1 ORDER BY sent_at, id",
+            "SELECT id, channel_id, author, sent_at, body, reply_to, edited_at, deleted
+             FROM messages WHERE channel_id = ?1 ORDER BY sent_at, id",
         )?;
         let rows = stmt.query_map(params![channel.to_string()], row_to_message)?;
         Ok(rows.filter_map(|row| row.ok()).collect())
@@ -199,8 +318,8 @@ impl Store {
     /// for a [`crate::chat::ChatPayload::HistoryRequest`].
     pub fn messages_since(&self, server_id: Uuid, since: i64) -> anyhow::Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel_id, author, sent_at, body FROM messages
-             WHERE server_id = ?1 AND sent_at > ?2 ORDER BY sent_at, id",
+            "SELECT id, channel_id, author, sent_at, body, reply_to, edited_at, deleted
+             FROM messages WHERE server_id = ?1 AND sent_at > ?2 ORDER BY sent_at, id",
         )?;
         let rows = stmt.query_map(params![server_id.to_string(), since], row_to_message)?;
         Ok(rows.filter_map(|row| row.ok()).collect())
@@ -265,12 +384,16 @@ impl Store {
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
     let id: String = row.get(0)?;
     let channel: String = row.get(1)?;
+    let reply_to: Option<String> = row.get(5)?;
     Ok(ChatMessage {
         id: id.parse().unwrap_or_else(|_| Uuid::nil()),
         channel: channel.parse().unwrap_or_else(|_| Uuid::nil()),
         author: row.get(2)?,
         sent_at: row.get(3)?,
         body: row.get(4)?,
+        reply_to: reply_to.and_then(|id| id.parse().ok()),
+        edited_at: row.get(6)?,
+        deleted: row.get(7)?,
     })
 }
 

@@ -68,6 +68,18 @@ impl TextInput {
     /// Empties the input, resetting the cursor with it — callers must not
     /// just overwrite `content`, or the selection could point past the end
     /// of the new (shorter) text.
+    /// Replaces the content wholesale, parking the cursor at the end — how
+    /// the inline message editor starts out prefilled. Same caveat as
+    /// [`Self::clear`]: the selection must be reset alongside the text.
+    pub fn set_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = content.into();
+        let end = self.content.len();
+        self.selected_range = end..end;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.content = "".into();
         self.selected_range = 0..0;

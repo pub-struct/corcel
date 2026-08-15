@@ -35,6 +35,33 @@ pub struct ChatMessage {
     pub author: String,
     pub sent_at: i64,
     pub body: String,
+    /// The message this one replies to, if any. `#[serde(default)]` keeps
+    /// old builds' payloads (which lack the field) deserializing.
+    #[serde(default)]
+    pub reply_to: Option<Uuid>,
+    /// When the author last edited this message (unix millis). `None` means
+    /// never edited; larger always wins when merging (last-writer-wins).
+    #[serde(default)]
+    pub edited_at: Option<i64>,
+    /// Tombstone: the author deleted this message. Monotone — once true it
+    /// can never merge back to false, so deletes survive any backfill order.
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// One member's reaction to one message, exactly as stored and replicated.
+/// Keyed by `(message_id, emoji, author)`; `removed` is the un-react
+/// tombstone and `at` is the author's clock — the newer `at` wins when two
+/// states of the same key meet (react → un-react → re-react all converge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionRow {
+    pub message_id: Uuid,
+    pub channel: ChannelId,
+    pub emoji: String,
+    pub author: String,
+    pub at: i64,
+    #[serde(default)]
+    pub removed: bool,
 }
 
 /// Everything peers say to each other inside a server's room. Serialized to
@@ -51,8 +78,25 @@ pub enum ChatPayload {
     /// The answer to a [`ChatPayload::HistoryRequest`]: every message the
     /// responder has that's newer than the requested `since`, in one batch
     /// (fine at friends scale; chunking can come when someone's history is
-    /// big enough to need it).
-    HistoryBatch { messages: Vec<ChatMessage> },
+    /// big enough to need it). `reactions` carries every reaction change
+    /// (including removals) newer than `since` — `#[serde(default)]` so
+    /// batches from old builds still parse.
+    HistoryBatch {
+        messages: Vec<ChatMessage>,
+        #[serde(default)]
+        reactions: Vec<ReactionRow>,
+    },
+    /// The author edited a message. Applied only if `edited_at` is newer
+    /// than what the receiver has (last-writer-wins); an edit for a message
+    /// the receiver doesn't know is dropped — backfill delivers the merged
+    /// message later.
+    Edit { message_id: Uuid, channel: ChannelId, edited_at: i64, body: String },
+    /// The author deleted a message. Sets the monotone tombstone; the row
+    /// stays (and replicates) so the delete wins over any resurrecting
+    /// backfill.
+    Delete { message_id: Uuid, channel: ChannelId, deleted_at: i64 },
+    /// One reaction toggled on (`removed: false`) or off (`removed: true`).
+    Reaction(ReactionRow),
     /// "I'm composing a message in this channel" — broadcast at most every
     /// few seconds while typing. Purely ephemeral: never stored, expires on
     /// the receiver's clock, and old builds drop the unknown tag silently

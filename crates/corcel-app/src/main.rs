@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use assets::icons;
-use chat::{ChatMessage, ChatPayload};
+use chat::{ChatMessage, ChatPayload, ReactionRow};
 use corcel_signal::{ClientMessage, PeerId, ServerMessage};
 use invite::{ChannelInfo, ChannelKind, ServerLink};
 use profile::Profile;
@@ -43,6 +43,11 @@ const CAMERA_DEVICE: &str = "/dev/video0";
 /// from the columns it's aligned against.
 const RAIL_WIDTH: f32 = 72.;
 const SIDEBAR_WIDTH: f32 = 240.;
+
+/// The fixed reaction palette — no emoji picker yet, these six cover the
+/// Discord staples. Each renders as an inline button under a message when
+/// its "add reaction" action is clicked.
+const REACTION_PALETTE: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "🎉"];
 
 /// Screen-share state for a connected call. `Pending` covers the window
 /// between the user clicking "Share Screen" and [`session::start_screen_share`]
@@ -320,6 +325,20 @@ struct Shell {
     /// When this user last broadcast a Typing payload — throttles the
     /// composer to one broadcast per few seconds, not one per keystroke.
     last_typing_sent: Option<Instant>,
+    /// The message the composer is currently replying to — stamped onto the
+    /// next send as its `reply_to`, shown as a bar above the composer, and
+    /// cleared by Escape, ✕, or sending.
+    replying_to: Option<ChatMessage>,
+    /// The message being edited inline, with the dedicated input that
+    /// replaces its body. Enter commits, Escape cancels.
+    editing: Option<(Uuid, Entity<TextInput>)>,
+    /// The message whose inline emoji palette is open, if any.
+    reacting_to: Option<Uuid>,
+    /// Live reactions of the on-screen text channel: message → chips in
+    /// first-reacted order, each an emoji with everyone who reacted with it.
+    /// Rebuilt from the store whenever the channel (re)loads or a reaction
+    /// lands (see [`Shell::reload_reactions`]).
+    chat_reactions: HashMap<Uuid, Vec<(String, Vec<String>)>>,
     add_server_open: bool,
     /// Briefly `true` after "Copy Invite Link" so the button itself can
     /// confirm the copy happened — clipboard writes are otherwise invisible.
@@ -357,6 +376,10 @@ impl Shell {
             switcher_selected: 0,
             typing: HashMap::new(),
             last_typing_sent: None,
+            replying_to: None,
+            editing: None,
+            reacting_to: None,
+            chat_reactions: HashMap::new(),
             add_server_open: false,
             link_copied: false,
             error,
@@ -613,6 +636,7 @@ impl Shell {
         *self.room_generations.entry(id).or_insert(0) += 1;
         self.rooms.remove(&id);
         self.chat_messages.clear();
+        self.reset_composer_state();
         if let Some(store) = &self.store {
             let _ = store.remove_server(id);
         }
@@ -638,6 +662,7 @@ impl Shell {
         }
         self.screen = Screen::Server { id, view: ServerView::Lobby };
         self.chat_messages.clear();
+        self.reset_composer_state();
         self.error = None;
         cx.notify();
     }
@@ -647,10 +672,41 @@ impl Shell {
         let id = *id;
         self.chat_messages =
             self.store.as_ref().and_then(|store| store.messages(channel.id).ok()).unwrap_or_default();
+        self.reset_composer_state();
+        self.reload_reactions(channel.id);
         self.mark_channel_read(channel.id);
         self.screen = Screen::Server { id, view: ServerView::Text { channel } };
         self.chat_scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    /// Drops every bit of in-flight composer/message-action state — a reply
+    /// half-set-up, an edit in progress, an open emoji palette. Called on
+    /// any navigation, since all of it is meaningless in another channel.
+    fn reset_composer_state(&mut self) {
+        self.replying_to = None;
+        self.editing = None;
+        self.reacting_to = None;
+        self.chat_reactions.clear();
+    }
+
+    /// Rebuilds [`Shell::chat_reactions`] for a channel from the store's
+    /// live (non-removed) reaction rows.
+    fn reload_reactions(&mut self, channel: Uuid) {
+        self.chat_reactions.clear();
+        let Some(store) = &self.store else { return };
+        let Ok(rows) = store.reactions_for(channel) else { return };
+        for (message_id, emoji, author) in rows {
+            let chips = self.chat_reactions.entry(message_id).or_default();
+            match chips.iter_mut().find(|(chip, _)| *chip == emoji) {
+                Some((_, authors)) => {
+                    if !authors.contains(&author) {
+                        authors.push(author);
+                    }
+                }
+                None => chips.push((emoji, vec![author])),
+            }
+        }
     }
 
     // ---- Unread tracking -----------------------------------------------
@@ -773,6 +829,15 @@ impl Shell {
             return;
         }
         if !self.switcher_open {
+            // Escape unwinds in-flight message state, most-specific first:
+            // an open edit, then the emoji palette, then the reply setup.
+            if key == "escape" {
+                if self.editing.is_some() {
+                    self.cancel_edit(cx);
+                } else if self.reacting_to.take().is_some() || self.replying_to.take().is_some() {
+                    cx.notify();
+                }
+            }
             return;
         }
         match key {
@@ -921,6 +986,13 @@ impl Shell {
             ServerMessage::Published { payload, .. } => match serde_json::from_value(payload) {
                 Ok(ChatPayload::Message(message)) => self.absorb_messages(server_id, vec![message], cx),
                 Ok(ChatPayload::Typing { channel, author }) => self.note_typing(channel, author, cx),
+                Ok(ChatPayload::Edit { message_id, channel, edited_at, body }) => {
+                    self.absorb_edit(server_id, message_id, channel, edited_at, body, cx);
+                }
+                Ok(ChatPayload::Delete { message_id, channel, .. }) => {
+                    self.absorb_delete(server_id, message_id, channel, cx);
+                }
+                Ok(ChatPayload::Reaction(reaction)) => self.absorb_reactions(server_id, vec![reaction], cx),
                 _ => {}
             },
             ServerMessage::Direct { from, payload } => match serde_json::from_value(payload) {
@@ -930,12 +1002,18 @@ impl Shell {
                 Ok(ChatPayload::HistoryRequest { since }) => {
                     let Some(store) = &self.store else { return };
                     let Ok(messages) = store.messages_since(server_id, since) else { return };
-                    self.send_room(server_id, ChatPayload::HistoryBatch { messages }, Some(from));
+                    let reactions = store.reactions_since(server_id, since).unwrap_or_default();
+                    self.send_room(server_id, ChatPayload::HistoryBatch { messages, reactions }, Some(from));
                 }
-                Ok(ChatPayload::HistoryBatch { messages }) => self.absorb_messages(server_id, messages, cx),
+                Ok(ChatPayload::HistoryBatch { messages, reactions }) => {
+                    self.absorb_messages(server_id, messages, cx);
+                    self.absorb_reactions(server_id, reactions, cx);
+                }
                 Ok(ChatPayload::Message(message)) => self.absorb_messages(server_id, vec![message], cx),
-                // Typing is broadcast-only; a direct one is a peer bug.
-                Ok(ChatPayload::Typing { .. }) | Err(_) => {}
+                // Everything else (Typing, Edit, …) is broadcast-only; a
+                // direct one is a peer bug, and unparseable JSON is a newer
+                // build's payload — both dropped.
+                _ => {}
             },
             _ => {}
         }
@@ -991,6 +1069,71 @@ impl Shell {
         cx.notify();
     }
 
+    /// Applies a broadcast edit (last-writer-wins in the store) and, if the
+    /// edited message is on screen, refreshes the view.
+    fn absorb_edit(
+        &mut self,
+        server_id: Uuid,
+        message_id: Uuid,
+        channel: Uuid,
+        edited_at: i64,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = &self.store else { return };
+        if !store.apply_edit(message_id, &body, edited_at).unwrap_or(false) {
+            return;
+        }
+        self.refresh_visible_channel(server_id, channel, cx);
+    }
+
+    /// Applies a broadcast delete tombstone; refreshes the view if the
+    /// message is on screen.
+    fn absorb_delete(&mut self, server_id: Uuid, message_id: Uuid, channel: Uuid, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else { return };
+        if !store.apply_delete(message_id).unwrap_or(false) {
+            return;
+        }
+        self.refresh_visible_channel(server_id, channel, cx);
+    }
+
+    /// Merges received reaction states (one from a live toggle, many from a
+    /// history batch) and refreshes whichever visible channel they touched.
+    fn absorb_reactions(&mut self, server_id: Uuid, reactions: Vec<ReactionRow>, cx: &mut Context<Self>) {
+        let mut changed_channels: Vec<Uuid> = Vec::new();
+        {
+            let Some(store) = self.store.as_ref() else { return };
+            for reaction in &reactions {
+                if store.upsert_reaction(reaction).unwrap_or(false) && !changed_channels.contains(&reaction.channel)
+                {
+                    changed_channels.push(reaction.channel);
+                }
+            }
+        }
+        for channel in changed_channels {
+            self.refresh_visible_channel(server_id, channel, cx);
+        }
+    }
+
+    /// If `channel` is the text channel on screen (in `server_id`), reloads
+    /// its messages and reactions from the store and re-renders. The no-op
+    /// case is the common one — most edits/reactions land for channels the
+    /// user isn't looking at, and the store already holds them.
+    fn refresh_visible_channel(&mut self, server_id: Uuid, channel: Uuid, cx: &mut Context<Self>) {
+        let viewing = matches!(
+            &self.screen,
+            Screen::Server { id, view: ServerView::Text { channel: viewing } }
+                if *id == server_id && viewing.id == channel
+        );
+        if !viewing {
+            return;
+        }
+        self.chat_messages =
+            self.store.as_ref().and_then(|store| store.messages(channel).ok()).unwrap_or_default();
+        self.reload_reactions(channel);
+        cx.notify();
+    }
+
     /// Records someone else's Typing payload; re-renders only if their
     /// channel is the one on screen (the strip is the only UI for it).
     fn note_typing(&mut self, channel: Uuid, author: String, cx: &mut Context<Self>) {
@@ -1035,8 +1178,16 @@ impl Shell {
             _ => return,
         };
         let author = self.profile.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "?".to_string());
-        let message =
-            ChatMessage { id: Uuid::new_v4(), channel: channel_id, author, sent_at: chat::now_millis(), body };
+        let message = ChatMessage {
+            id: Uuid::new_v4(),
+            channel: channel_id,
+            author,
+            sent_at: chat::now_millis(),
+            body,
+            reply_to: self.replying_to.take().map(|original| original.id),
+            edited_at: None,
+            deleted: false,
+        };
 
         // Local first: the message is durably ours before the network hears
         // about it. If nobody's online right now, peers will pick it up via
@@ -1051,6 +1202,112 @@ impl Shell {
         self.last_typing_sent = None;
         self.message_input.update(cx, |input, cx| input.clear(cx));
         self.chat_scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    // ---- Message actions (reply / edit / delete / react) ---------------
+
+    /// The server and channel of the text view on screen — every message
+    /// action below is only reachable from there.
+    fn visible_text_channel(&self) -> Option<(Uuid, Uuid)> {
+        match &self.screen {
+            Screen::Server { id, view: ServerView::Text { channel } } => Some((*id, channel.id)),
+            _ => None,
+        }
+    }
+
+    fn start_reply(&mut self, message: ChatMessage, window: &mut Window, cx: &mut Context<Self>) {
+        self.replying_to = Some(message);
+        self.editing = None;
+        self.reacting_to = None;
+        window.focus(&self.message_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn start_edit(&mut self, message: &ChatMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| TextInput::new("Edit message…", cx));
+        input.update(cx, |input, cx| input.set_content(message.body.clone(), cx));
+        window.focus(&input.focus_handle(cx));
+        self.editing = Some((message.id, input));
+        self.replying_to = None;
+        self.reacting_to = None;
+        cx.notify();
+    }
+
+    /// Enter in the inline editor: persist the edit locally (last-writer-
+    /// wins, so our own newer timestamp always applies), broadcast it, and
+    /// refresh. An emptied editor just cancels — delete is its own action.
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((message_id, input)) = self.editing.take() else { return };
+        let Some((server_id, channel_id)) = self.visible_text_channel() else {
+            cx.notify();
+            return;
+        };
+        let body = input.read(cx).content.trim().to_string();
+        if body.is_empty() {
+            cx.notify();
+            return;
+        }
+        let edited_at = chat::now_millis();
+        if let Some(store) = &self.store {
+            let _ = store.apply_edit(message_id, &body, edited_at);
+        }
+        self.send_room(server_id, ChatPayload::Edit { message_id, channel: channel_id, edited_at, body }, None);
+        self.refresh_visible_channel(server_id, channel_id, cx);
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Deletes one of this user's own messages: tombstone locally, then
+    /// broadcast. No confirmation — the stub it leaves behind makes the
+    /// action obvious and the blast radius is one message.
+    fn delete_message(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
+        let Some((server_id, channel_id)) = self.visible_text_channel() else { return };
+        if let Some(store) = &self.store {
+            let _ = store.apply_delete(message_id);
+        }
+        self.send_room(
+            server_id,
+            ChatPayload::Delete { message_id, channel: channel_id, deleted_at: chat::now_millis() },
+            None,
+        );
+        if self.editing.as_ref().is_some_and(|(editing_id, _)| *editing_id == message_id) {
+            self.editing = None;
+        }
+        self.refresh_visible_channel(server_id, channel_id, cx);
+        cx.notify();
+    }
+
+    /// Flips this user's reaction state for one `(message, emoji)`: on if
+    /// they hadn't reacted, off if they had. Store first, then broadcast —
+    /// same local-first rule as messages.
+    fn toggle_reaction(&mut self, message_id: Uuid, emoji: &str, cx: &mut Context<Self>) {
+        let Some((server_id, channel_id)) = self.visible_text_channel() else { return };
+        let author = self.my_name();
+        let removed = self
+            .chat_reactions
+            .get(&message_id)
+            .and_then(|chips| chips.iter().find(|(chip, _)| chip == emoji))
+            .is_some_and(|(_, authors)| authors.contains(&author));
+        let reaction = ReactionRow {
+            message_id,
+            channel: channel_id,
+            emoji: emoji.to_string(),
+            author,
+            at: chat::now_millis(),
+            removed,
+        };
+        if let Some(store) = &self.store {
+            let _ = store.upsert_reaction(&reaction);
+        }
+        self.send_room(server_id, ChatPayload::Reaction(reaction), None);
+        self.reacting_to = None;
+        self.reload_reactions(channel_id);
         cx.notify();
     }
 
@@ -2371,6 +2628,20 @@ impl Shell {
 
         let profile_name = profile.name.clone();
         let profile_avatar = profile.avatar_path.clone();
+        // Author + snippet of every loaded message, so reply quotes render
+        // without a per-row rescan of the list.
+        let quotes: HashMap<Uuid, (String, String)> = self
+            .chat_messages
+            .iter()
+            .map(|message| {
+                let snippet: String = if message.deleted {
+                    "message deleted".to_string()
+                } else {
+                    message.body.chars().take(90).collect()
+                };
+                (message.id, (message.author.clone(), snippet))
+            })
+            .collect();
         let message_rows = self
             .chat_messages
             .iter()
@@ -2386,9 +2657,200 @@ impl Shell {
                     .next()
                     .map(|c| c.to_uppercase().to_string())
                     .unwrap_or_else(|| "?".to_string());
-                let mentions_me = !is_self && richtext::mentions_user(&message.body, &profile_name);
+                let mentions_me =
+                    !message.deleted && !is_self && richtext::mentions_user(&message.body, &profile_name);
+                let message_id = message.id;
+                // Each row is its own hover group so its action bar can
+                // appear on hover without any per-row state.
+                let group_name: SharedString = format!("msg-{message_id}").into();
+                let is_editing = self.editing.as_ref().is_some_and(|(id, _)| *id == message_id);
+                let palette_open = self.reacting_to == Some(message_id) && !message.deleted;
+
+                // The quoted line above a reply: the original's author and a
+                // snippet, or an honest fallback when we don't have it.
+                let quote = message.reply_to.map(|original| {
+                    let (author, snippet) = quotes
+                        .get(&original)
+                        .cloned()
+                        .unwrap_or_else(|| ("?".to_string(), "Original message not loaded".to_string()));
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(12.))
+                        .text_color(theme::muted_foreground())
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(theme::icon(icons::REPLY, px(12.)).text_color(theme::faint_foreground()))
+                        .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(author))
+                        .child(snippet)
+                });
+
+                // The body slot: a delete tombstone stub, the inline editor
+                // (Enter commits via key bubbling, Escape is handled by the
+                // root key handler), or the normal rendered text.
+                let body: gpui::AnyElement = if message.deleted {
+                    div()
+                        .text_size(px(13.))
+                        .italic()
+                        .text_color(theme::faint_foreground())
+                        .child("message deleted")
+                        .into_any_element()
+                } else if is_editing {
+                    let input = self.editing.as_ref().map(|(_, input)| input.clone()).expect("is_editing");
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .on_key_down(cx.listener(|shell, event: &KeyDownEvent, _window, cx| {
+                            if event.keystroke.key == "enter" {
+                                shell.commit_edit(cx);
+                            }
+                        }))
+                        .child(input)
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::faint_foreground())
+                                .child("enter to save · escape to cancel"),
+                        )
+                        .into_any_element()
+                } else {
+                    richtext::render_body(&message.body)
+                };
+
+                // Reaction chips: emoji + count, outlined in blurple when
+                // this user is among the reactors. Click toggles.
+                let chips = (!message.deleted)
+                    .then(|| self.chat_reactions.get(&message_id))
+                    .flatten()
+                    .filter(|chips| !chips.is_empty())
+                    .map(|chips| {
+                        div().flex().flex_wrap().gap(px(4.)).mt(px(2.)).children(chips.iter().map(
+                            |(emoji, authors)| {
+                                let mine = authors.contains(&profile_name);
+                                let emoji_for_click = emoji.clone();
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .px(px(7.))
+                                    .py(px(2.))
+                                    .rounded_full()
+                                    .bg(theme::wash())
+                                    .border_1()
+                                    .border_color(if mine { theme::primary() } else { theme::border() })
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::wash_strong()))
+                                    .text_size(px(12.))
+                                    .child(emoji.clone())
+                                    .child(
+                                        div()
+                                            .text_color(theme::muted_foreground())
+                                            .child(authors.len().to_string()),
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |shell, _, _window, cx| {
+                                            shell.toggle_reaction(message_id, &emoji_for_click, cx);
+                                        }),
+                                    )
+                            },
+                        ))
+                    });
+
+                // The inline emoji palette, opened by the smile action. The
+                // extra flex wrapper keeps it content-sized instead of
+                // stretching across the column.
+                let palette = palette_open.then(|| {
+                    div().flex().mt(px(4.)).child(
+                        div()
+                            .flex()
+                            .gap(px(2.))
+                            .p(px(3.))
+                            .rounded_md()
+                            .bg(theme::popover())
+                            .border_1()
+                            .border_color(theme::border())
+                            .shadow_md()
+                            .children(REACTION_PALETTE.iter().map(|emoji| {
+                                let emoji = *emoji;
+                                div()
+                                    .size(px(30.))
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::wash_strong()))
+                                    .text_size(px(16.))
+                                    .child(emoji)
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |shell, _, _window, cx| {
+                                            shell.toggle_reaction(message_id, emoji, cx);
+                                        }),
+                                    )
+                            })),
+                    )
+                });
+
+                // The hover action bar: reply + react on every message,
+                // edit/delete only on this user's own. Deleted messages get
+                // no actions at all.
+                let actions = (!message.deleted).then(|| {
+                    let reply_message = message.clone();
+                    let edit_message = message.clone();
+                    let mut bar = div()
+                        .absolute()
+                        .top(px(-8.))
+                        .right(px(16.))
+                        .flex()
+                        .gap(px(2.))
+                        .p(px(2.))
+                        .rounded_md()
+                        .bg(theme::popover())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_md()
+                        .invisible()
+                        .group_hover(group_name.clone(), |style| style.visible())
+                        .child(message_action(icons::REPLY, false).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, window, cx| {
+                                shell.start_reply(reply_message.clone(), window, cx);
+                            }),
+                        ))
+                        .child(message_action(icons::SMILE_PLUS, false).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _window, cx| {
+                                shell.reacting_to =
+                                    if shell.reacting_to == Some(message_id) { None } else { Some(message_id) };
+                                cx.notify();
+                            }),
+                        ));
+                    if is_self {
+                        bar = bar
+                            .child(message_action(icons::PENCIL, false).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _, window, cx| {
+                                    shell.start_edit(&edit_message, window, cx);
+                                }),
+                            ))
+                            .child(message_action(icons::TRASH, true).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _, _window, cx| {
+                                    shell.delete_message(message_id, cx);
+                                }),
+                            ));
+                    }
+                    bar
+                });
 
                 div()
+                    .relative()
+                    .group(group_name)
                     .flex()
                     .gap(px(12.))
                     .px(px(16.))
@@ -2401,6 +2863,7 @@ impl Shell {
                         wash.a = 0.08;
                         style.bg(wash).border_l_2().border_color(theme::mention()).pl(px(14.))
                     })
+                    .children(actions)
                     .child(div().flex_none().child(theme::avatar(avatar, initial, px(36.))))
                     .child(
                         div()
@@ -2409,6 +2872,7 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .gap(px(2.))
+                            .children(quote)
                             .child(
                                 div()
                                     .flex()
@@ -2425,9 +2889,19 @@ impl Shell {
                                             .text_size(px(11.))
                                             .text_color(theme::faint_foreground())
                                             .child(format_timestamp(message.sent_at)),
-                                    ),
+                                    )
+                                    .when(message.edited_at.is_some() && !message.deleted, |header| {
+                                        header.child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(theme::faint_foreground())
+                                                .child("(edited)"),
+                                        )
+                                    }),
                             )
-                            .child(richtext::render_body(&message.body)),
+                            .child(body)
+                            .children(chips)
+                            .children(palette),
                     )
             })
             .collect::<Vec<_>>();
@@ -2467,6 +2941,55 @@ impl Shell {
             .text_color(theme::muted_foreground())
             .child(typing_label);
 
+        // The "Replying to Alice ✕" bar that docks onto the composer while
+        // a reply is being written. Escape (root handler) or ✕ clears it.
+        let reply_bar = self.replying_to.as_ref().map(|original| {
+            let author = original.author.clone();
+            div()
+                .flex_none()
+                .mx(px(16.))
+                .px(px(12.))
+                .py(px(6.))
+                .rounded_t_md()
+                .bg(theme::card())
+                .flex()
+                .items_center()
+                .justify_between()
+                .text_size(px(12.))
+                .text_color(theme::muted_foreground())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child("Replying to")
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::foreground())
+                                .child(author),
+                        ),
+                )
+                .child(
+                    div()
+                        .size(px(18.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::wash_strong()))
+                        .child(theme::icon(icons::X, px(12.)).text_color(theme::muted_foreground()))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _, _window, cx| {
+                                shell.replying_to = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+        });
+
         let composer = div()
             .flex_none()
             .px(px(16.))
@@ -2490,6 +3013,7 @@ impl Shell {
             .child(header)
             .child(scrollback)
             .child(typing_strip)
+            .children(reply_bar)
             .child(composer)
     }
 
@@ -2922,6 +3446,22 @@ fn stage_tile(
 /// A message's send time in the reader's local timezone — "Today at HH:MM"
 /// for today, a full date otherwise. The author's clock stamped it (see
 /// [`chat::ChatMessage::sent_at`]); at friends scale that's plenty.
+/// One small icon button in a message's hover action bar — callers attach
+/// `.on_mouse_up(...)`. `destructive` tints the icon red (the delete
+/// action).
+fn message_action(icon_path: &'static str, destructive: bool) -> Div {
+    let color = if destructive { theme::destructive_foreground() } else { theme::muted_foreground() };
+    div()
+        .size(px(26.))
+        .rounded_md()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::wash_strong()))
+        .child(theme::icon(icon_path, px(15.)).text_color(color))
+}
+
 fn format_timestamp(millis: i64) -> String {
     use chrono::{Local, TimeZone};
     let Some(time) = Local.timestamp_millis_opt(millis).single() else {
