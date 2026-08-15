@@ -750,9 +750,12 @@ impl Shell {
                                 .gap(px(10.))
                                 .p(px(10.))
                                 .rounded_full()
-                                .bg(theme::popover())
+                                // The canonical Liquid Glass element:
+                                // floating controls in a glass capsule
+                                // over the stage.
+                                .bg(theme::glass())
                                 .border_1()
-                                .border_color(theme::border())
+                                .border_color(theme::glass_edge())
                                 .shadow_lg()
                                 .child(mute_btn)
                                 .child(deafen_btn)

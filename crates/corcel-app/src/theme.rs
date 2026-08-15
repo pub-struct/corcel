@@ -165,6 +165,20 @@ pub fn pill(variant: PillVariant, label: impl Into<SharedString>) -> Div {
         .child(label.into())
 }
 
+/// The Liquid Glass fill for floating controls (the call bar and friends):
+/// noticeably more translucent than [`popover`] so the content behind
+/// shows through the pane, per Apple's "controls float above content"
+/// layer model. Pair with [`glass_edge`] for the light rim.
+pub fn glass() -> Rgba {
+    rgba(0x1e2027a8)
+}
+
+/// The hairline light rim of a glass pane — brighter than [`border`], it
+/// reads as the pane's lit edge.
+pub fn glass_edge() -> Rgba {
+    rgba(0xffffff2e)
+}
+
 /// The glossy azure fill for primary actions — a vertical light-to-deep
 /// gradient, the same idiom as the icon set's glass layers.
 pub fn primary_gradient() -> gpui::Background {
