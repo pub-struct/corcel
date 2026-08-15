@@ -1228,9 +1228,9 @@ impl Shell {
                             .h(px(260.))
                             .p(px(6.))
                             .rounded_lg()
-                            .bg(theme::popover())
+                            .bg(theme::raised_fill())
                             .border_1()
-                            .border_color(theme::border())
+                            .border_color(theme::glass_edge())
                             .shadow_md()
                             .on_mouse_down_out(cx.listener(|shell, _, _window, cx| {
                                 if shell.reacting_to.take().is_some() {
@@ -1627,9 +1627,9 @@ impl Shell {
                             .mb(px(4.))
                             .min_w(px(220.))
                             .rounded_lg()
-                            .bg(theme::popover())
+                            .bg(theme::raised_fill())
                             .border_1()
-                            .border_color(theme::border())
+                            .border_color(theme::glass_edge())
                             .shadow_md()
                             .children(rows)
                             .with_animation(

@@ -27,18 +27,18 @@ use gpui::{
 // surfaces (popover) the most opaque so text always stays readable.
 
 pub fn rail() -> Rgba {
-    rgba(0x111217d9)
+    rgba(0x111112d9)
 }
 
 /// Channel sidebar / member list background — one step lighter than the
 /// rail.
 pub fn card() -> Rgba {
-    rgba(0x1a1b21d9)
+    rgba(0x18181ad9)
 }
 
 /// Elevated surfaces: modals, the call dock, hover profile cards.
 pub fn popover() -> Rgba {
-    rgba(0x202128ee)
+    rgba(0x1e1e20f2)
 }
 
 /// Main content background (chat, video panel, empty states). Opaque on
@@ -46,7 +46,7 @@ pub fn popover() -> Rgba {
 /// chrome floating *above* content — content itself stays a solid, calm
 /// ground the glass can refract.
 pub fn background() -> Rgba {
-    rgb(0x15161b)
+    rgb(0x121213)
 }
 
 /// Hover / active row background within a sidebar or list.
@@ -59,11 +59,11 @@ pub fn wash_strong() -> Rgba {
 }
 
 pub fn border() -> Rgba {
-    rgba(0xffffff14)
+    rgba(0xffffff0f)
 }
 
 pub fn input_border() -> Rgba {
-    rgba(0xffffff24)
+    rgba(0xffffff1f)
 }
 
 /// The focus-ring color, used for the one border that's meant to stand out
@@ -158,7 +158,7 @@ pub fn pill(variant: PillVariant, label: impl Into<SharedString>) -> Div {
         .rounded_full()
         .border_1()
         .border_color(border())
-        .bg(popover())
+        .bg(raised_fill())
         .text_size(gpui::px(11.5))
         .text_color(text_color)
         .child(div().size(gpui::px(6.)).rounded_full().bg(dot_color))
@@ -179,13 +179,55 @@ pub fn glass_edge() -> Rgba {
     rgba(0xffffff2e)
 }
 
+/// The 1px "border" ring that makes a component read as 3D: light where
+/// light would hit (top), falling to shadow at the bottom. GPUI only has
+/// one border color per element, so the ring is a gradient-filled wrapper
+/// a hair larger than its content — the classic gradient-border trick.
+pub fn bevel_ring() -> gpui::Background {
+    gpui::linear_gradient(
+        180.,
+        gpui::linear_color_stop(gpui::rgba(0xffffff29), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x00000059), 1.),
+    )
+}
+
+/// The matching surface fill: faintly lighter at the top than the bottom,
+/// so the face of the component curves with the same light as its ring.
+pub fn raised_fill() -> gpui::Background {
+    gpui::linear_gradient(
+        180.,
+        gpui::linear_color_stop(gpui::rgba(0x242426f5), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x161617f5), 1.),
+    )
+}
+
+/// Wraps `inner` in a [`bevel_ring`] so it reads as a raised 3D piece.
+/// `radius` is the outer radius; the inner element should carry its own
+/// fill and a radius ~1px smaller.
+pub fn raised(radius: Pixels, inner: Div) -> Div {
+    div().rounded(radius).p(px(1.)).bg(bevel_ring()).shadow_md().child(inner)
+}
+
 /// The glossy azure fill for primary actions — a vertical light-to-deep
 /// gradient, the same idiom as the icon set's glass layers.
+/// coss.com/ui's signature primary: a light (near-white) face with dark
+/// text — the one high-contrast element on the near-black ground. The
+/// vertical falloff plus [`primary_ring`] give it the raised-3D read.
 pub fn primary_gradient() -> gpui::Background {
     gpui::linear_gradient(
         180.,
-        gpui::linear_color_stop(gpui::rgba(0x54a9ffff), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x1e7be6ff), 1.),
+        gpui::linear_color_stop(gpui::rgba(0xffffffff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0xdededfff), 1.),
+    )
+}
+
+/// [`bevel_ring`] for the light primary: bright lit top edge into a
+/// gray shadow edge.
+pub fn primary_ring() -> gpui::Background {
+    gpui::linear_gradient(
+        180.,
+        gpui::linear_color_stop(gpui::rgba(0xffffffff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x8a8a8fff), 1.),
     )
 }
 
@@ -195,8 +237,8 @@ pub fn primary_gradient() -> gpui::Background {
 pub fn aurora() -> gpui::Background {
     gpui::linear_gradient(
         150.,
-        gpui::linear_color_stop(gpui::rgba(0x24262eff), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x101115ff), 1.),
+        gpui::linear_color_stop(gpui::rgba(0x1b1b1dff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x0f0f10ff), 1.),
     )
 }
 
@@ -212,21 +254,21 @@ pub fn button(variant: ButtonVariant, label: impl Into<SharedString>) -> Div {
     let base = div()
         .px(gpui::px(16.))
         .py(gpui::px(9.))
-        .rounded_md() // --radius-md (6px)
         .text_size(gpui::px(14.))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .child(label.into());
 
     match variant {
-        ButtonVariant::Primary => base
-            .bg(primary_gradient())
-            .border_1()
-            .border_color(gpui::rgba(0xffffff38))
-            .shadow_md()
-            .text_color(primary_foreground())
-            .hover(|style| style.bg(primary_hover())),
+        ButtonVariant::Primary => div().rounded(px(10.)).p(px(1.)).bg(primary_ring()).shadow_sm().child(
+            base.rounded(px(9.))
+                .bg(primary_gradient())
+                .text_color(gpui::rgb(0x1a1a1c))
+                .font_weight(FontWeight::SEMIBOLD)
+                .hover(|style| style.bg(gpui::rgb(0xe6e6e8))),
+        ),
         ButtonVariant::Ghost => base
+            .rounded_md()
             .text_color(muted_foreground())
             .hover(|style| style.bg(wash()).text_color(foreground())),
     }

@@ -785,9 +785,9 @@ impl Shell {
                             .gap(px(2.))
                             .p(px(6.))
                             .rounded_xl()
-                            .bg(theme::popover())
+                            .bg(theme::raised_fill())
                             .border_1()
-                            .border_color(theme::border())
+                            .border_color(theme::glass_edge())
                             .shadow_lg()
                             .on_mouse_down_out(cx.listener(|shell, _, _window, cx| {
                                 if let Some(call) = shell.connected_call_mut() {
@@ -912,16 +912,26 @@ pub(super) fn call_button(
     background: Rgba,
     pending: bool,
 ) -> Stateful<Div> {
+    // A raised 3D disc: the outer circle is the light-to-shadow bevel
+    // ring (see theme::bevel_ring), the inner face carries the state
+    // color — the same light model as the glass icons it holds.
     let button = div()
         .id(id)
         .size(px(44.))
         .rounded_full()
         .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(background)
-        .child(theme::icon(icon_path, px(20.)).text_color(theme::primary_foreground()));
+        .p(px(1.))
+        .bg(theme::bevel_ring())
+        .child(
+            div()
+                .size_full()
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(background)
+                .child(theme::icon(icon_path, px(20.)).text_color(theme::primary_foreground())),
+        );
 
     if pending {
         button.opacity(0.5).tooltip(theme::tooltip(label))

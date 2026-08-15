@@ -216,7 +216,7 @@ impl Shell {
                 // More frost than the call bar: GPUI has no per-element
                 // backdrop blur, so a see-through menu reads as leaky
                 // rather than glassy — near-opaque like Discord's.
-                .bg(theme::popover())
+                .bg(theme::raised_fill())
                 .border_1()
                 .border_color(theme::glass_edge())
                 .shadow_lg()
