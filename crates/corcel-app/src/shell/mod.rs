@@ -812,6 +812,12 @@ impl Render for Shell {
             .relative()
             .flex()
             .flex_col()
+            // Theme ground truth for the whole tree: every screen and —
+            // crucially — every `deferred` overlay inherits these, so a
+            // modal can never fall back to the window default (black text)
+            // just because its own subtree forgot to set a color.
+            .bg(theme::background())
+            .text_color(theme::foreground())
             .on_key_down(cx.listener(Self::root_key_down))
             .on_key_up(cx.listener(Self::root_key_up))
             // The custom titlebar sits above everything (the native one is
