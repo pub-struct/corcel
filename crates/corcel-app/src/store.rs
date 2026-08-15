@@ -61,6 +61,12 @@ const MIGRATIONS: &[&str] = &[
         ON messages (channel_id, sent_at);
     CREATE INDEX IF NOT EXISTS messages_by_server_time
         ON messages (server_id, sent_at);",
+    // 2: unread tracking — the newest sent_at this user has *seen* (not
+    // merely stored) per channel. Purely local, never replicated.
+    "CREATE TABLE last_read (
+        channel_id TEXT PRIMARY KEY,
+        last_read  INTEGER NOT NULL
+    );",
 ];
 
 impl Store {
@@ -198,6 +204,47 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![server_id.to_string(), since], row_to_message)?;
         Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Marks a channel read up to `ts` — everything at or before it stops
+    /// counting as unread.
+    pub fn set_last_read(&self, channel: ChannelId, ts: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO last_read (channel_id, last_read) VALUES (?1, ?2)
+             ON CONFLICT(channel_id) DO UPDATE SET last_read = excluded.last_read",
+            params![channel.to_string(), ts],
+        )?;
+        Ok(())
+    }
+
+    /// Per-channel `(unread, mentions)` counts for a server — messages newer
+    /// than the channel's `last_read`, excluding this user's own. The
+    /// mention test is a coarse `LIKE '%@name%'` (can over-count `@namely`);
+    /// the precise per-message check lives in [`crate::richtext`], which is
+    /// what actually highlights rows. Channels with nothing unread aren't
+    /// returned.
+    pub fn unread_counts(&self, server_id: Uuid, my_name: &str) -> anyhow::Result<Vec<(ChannelId, u32, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.channel_id,
+                    COUNT(*),
+                    SUM(CASE WHEN m.body LIKE '%@' || ?2 || '%' THEN 1 ELSE 0 END)
+             FROM messages m
+             LEFT JOIN last_read r ON r.channel_id = m.channel_id
+             WHERE m.server_id = ?1
+               AND m.author <> ?2
+               AND m.sent_at > COALESCE(r.last_read, 0)
+             GROUP BY m.channel_id",
+        )?;
+        let rows = stmt.query_map(params![server_id.to_string(), my_name], |row| {
+            let channel: String = row.get(0)?;
+            let unread: u32 = row.get(1)?;
+            let mentions: u32 = row.get(2)?;
+            Ok((channel, unread, mentions))
+        })?;
+        Ok(rows
+            .filter_map(|row| row.ok())
+            .filter_map(|(channel, unread, mentions)| Some((channel.parse().ok()?, unread, mentions)))
+            .collect())
     }
 
     /// The newest `sent_at` this user has for a server, or `None` when they

@@ -2,6 +2,7 @@ mod assets;
 mod chat;
 mod invite;
 mod profile;
+mod richtext;
 mod runtime;
 mod session;
 mod store;
@@ -191,6 +192,46 @@ struct ChatRoom {
     outbound: mpsc::UnboundedSender<ClientMessage>,
 }
 
+/// One row of the Ctrl+K quick switcher: a server itself (`channel: None`)
+/// or one of its channels.
+#[derive(Clone)]
+struct SwitcherItem {
+    server_id: Uuid,
+    server_name: String,
+    channel: Option<ChannelInfo>,
+}
+
+impl SwitcherItem {
+    fn label(&self) -> &str {
+        self.channel.as_ref().map(|channel| channel.name.as_str()).unwrap_or(&self.server_name)
+    }
+}
+
+/// How well `candidate` matches the switcher query — higher is better,
+/// `None` filters the row out. Empty queries match everything, so the
+/// switcher opens showing the full list.
+fn match_score(candidate: &str, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let candidate = candidate.to_lowercase();
+    let query = query.to_lowercase();
+    if candidate.starts_with(&query) {
+        Some(3)
+    } else if candidate.contains(&query) {
+        Some(2)
+    } else if is_subsequence(&query, &candidate) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut chars = haystack.chars();
+    needle.chars().all(|needed| chars.any(|c| c == needed))
+}
+
 /// What the main panel shows for the active server.
 enum ServerView {
     /// The server's welcome screen — no channel selected yet.
@@ -259,6 +300,18 @@ struct Shell {
     message_input: Entity<TextInput>,
     server_name_input: Entity<TextInput>,
     join_link_input: Entity<TextInput>,
+    /// Per-channel `(unread, mentions)` counts across *all* servers, kept in
+    /// sync with the store's `last_read` table (see
+    /// [`store::Store::unread_counts`]). Channels absent from the map have
+    /// nothing unread. Channel ids are globally unique, so one flat map
+    /// serves both the sidebar rows and the rail's per-server aggregates.
+    unread: HashMap<Uuid, (u32, u32)>,
+    /// The Ctrl+K quick switcher: an overlay listing every server and
+    /// channel, filtered by a fuzzy query. `switcher_selected` indexes into
+    /// the *filtered* result list and is clamped at use.
+    switcher_open: bool,
+    switcher_input: Entity<TextInput>,
+    switcher_selected: usize,
     add_server_open: bool,
     /// Briefly `true` after "Copy Invite Link" so the button itself can
     /// confirm the copy happened — clipboard writes are otherwise invisible.
@@ -290,6 +343,10 @@ impl Shell {
             message_input: cx.new(|cx| TextInput::new("Send a message…", cx)),
             server_name_input: cx.new(|cx| TextInput::new("My Server", cx)),
             join_link_input: cx.new(|cx| TextInput::new("Paste an invite link...", cx)),
+            unread: HashMap::new(),
+            switcher_open: false,
+            switcher_input: cx.new(|cx| TextInput::new("Where would you like to go?", cx)),
+            switcher_selected: 0,
             add_server_open: false,
             link_copied: false,
             error,
@@ -300,6 +357,7 @@ impl Shell {
         // servers replicate too (see [`ChatRoom`]).
         for id in shell.servers.iter().map(|server| server.link.id).collect::<Vec<_>>() {
             shell.connect_chat(id, cx);
+            shell.refresh_unread(id);
         }
         // Land the user back in the server they'd expect instead of an
         // empty Home — the first one in the rail.
@@ -557,9 +615,149 @@ impl Shell {
         let id = *id;
         self.chat_messages =
             self.store.as_ref().and_then(|store| store.messages(channel.id).ok()).unwrap_or_default();
+        self.mark_channel_read(channel.id);
         self.screen = Screen::Server { id, view: ServerView::Text { channel } };
         self.chat_scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    // ---- Unread tracking -----------------------------------------------
+
+    fn my_name(&self) -> String {
+        self.profile.as_ref().map(|p| p.name.clone()).unwrap_or_default()
+    }
+
+    /// Marks a channel read as of now: everything currently stored for it
+    /// stops counting as unread, durably and in the in-memory badge map.
+    fn mark_channel_read(&mut self, channel: Uuid) {
+        if let Some(store) = &self.store {
+            let _ = store.set_last_read(channel, chat::now_millis());
+        }
+        self.unread.remove(&channel);
+    }
+
+    /// Reloads one server's unread/mention counts from the store into
+    /// [`Shell::unread`]. Called on startup and whenever new messages land
+    /// for the server (including for *background* servers — that's what the
+    /// badges are for).
+    fn refresh_unread(&mut self, server_id: Uuid) {
+        let channel_ids: Vec<Uuid> = self
+            .servers
+            .iter()
+            .find(|server| server.link.id == server_id)
+            .map(|server| server.link.channels.iter().map(|channel| channel.id).collect())
+            .unwrap_or_default();
+        for id in &channel_ids {
+            self.unread.remove(id);
+        }
+        let name = self.my_name();
+        let Some(store) = &self.store else { return };
+        let Ok(counts) = store.unread_counts(server_id, &name) else { return };
+        for (channel, unread, mentions) in counts {
+            self.unread.insert(channel, (unread, mentions));
+        }
+    }
+
+    // ---- Quick switcher ------------------------------------------------
+
+    /// The filtered, ranked switcher rows for a query: all servers and all
+    /// of their channels, best matches first (ties keep rail/sidebar order,
+    /// the sort is stable).
+    fn switcher_items(&self, query: &str) -> Vec<SwitcherItem> {
+        let mut scored: Vec<(u8, SwitcherItem)> = Vec::new();
+        for server in &self.servers {
+            let server_name = server.link.name.clone();
+            if let Some(score) = match_score(&server_name, query) {
+                scored.push((
+                    score,
+                    SwitcherItem { server_id: server.link.id, server_name: server_name.clone(), channel: None },
+                ));
+            }
+            for channel in &server.link.channels {
+                if let Some(score) = match_score(&channel.name, query) {
+                    scored.push((
+                        score,
+                        SwitcherItem {
+                            server_id: server.link.id,
+                            server_name: server_name.clone(),
+                            channel: Some(channel.clone()),
+                        },
+                    ));
+                }
+            }
+        }
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored.into_iter().map(|(_, item)| item).collect()
+    }
+
+    fn open_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher_open = true;
+        self.switcher_selected = 0;
+        self.switcher_input.update(cx, |input, cx| input.clear(cx));
+        window.focus(&self.switcher_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_switcher(&mut self, cx: &mut Context<Self>) {
+        self.switcher_open = false;
+        cx.notify();
+    }
+
+    /// Enter (or a row click): jump to the selected result — a server's
+    /// lobby, a text channel, or straight into a voice channel.
+    fn switcher_activate(&mut self, cx: &mut Context<Self>) {
+        let query = self.switcher_input.read(cx).content.trim().to_string();
+        let items = self.switcher_items(&query);
+        if items.is_empty() {
+            return;
+        }
+        let item = items[self.switcher_selected.min(items.len() - 1)].clone();
+        self.switcher_open = false;
+        self.open_server(item.server_id, cx);
+        match item.channel {
+            Some(channel) if channel.kind == ChannelKind::Text => self.open_text_channel(channel, cx),
+            Some(channel) => self.enter_voice_channel(channel, cx),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// The root key handler — the outermost element sees every key event
+    /// bubble up from whatever's focused, which is what makes app-wide keys
+    /// (F11, Ctrl+K, and the switcher's navigation keys while it's open)
+    /// work without a global keymap.
+    fn root_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "f11" {
+            window.toggle_fullscreen();
+            return;
+        }
+        if key == "k" && event.keystroke.modifiers.control {
+            if self.switcher_open {
+                self.close_switcher(cx);
+            } else {
+                self.open_switcher(window, cx);
+            }
+            return;
+        }
+        if !self.switcher_open {
+            return;
+        }
+        match key {
+            "escape" => self.close_switcher(cx),
+            "enter" => self.switcher_activate(cx),
+            "up" => {
+                self.switcher_selected = self.switcher_selected.saturating_sub(1);
+                cx.notify();
+            }
+            "down" => {
+                let query = self.switcher_input.read(cx).content.trim().to_string();
+                let count = self.switcher_items(&query).len();
+                self.switcher_selected = (self.switcher_selected + 1).min(count.saturating_sub(1));
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     // ---- Chat ----------------------------------------------------------
@@ -736,17 +934,24 @@ impl Shell {
         if !any_new {
             return;
         }
-        let refreshed = match &self.screen {
-            Screen::Server { id, view: ServerView::Text { channel } } if *id == server_id => {
-                self.store.as_ref().and_then(|store| store.messages(channel.id).ok())
-            }
+        // The channel on screen is read-as-they-arrive; everything else
+        // gains badges. Marking read must precede the recount or the
+        // on-screen channel would count its own fresh messages.
+        let viewing = match &self.screen {
+            Screen::Server { id, view: ServerView::Text { channel } } if *id == server_id => Some(channel.id),
             _ => None,
         };
+        if let Some(channel_id) = viewing {
+            self.mark_channel_read(channel_id);
+        }
+        self.refresh_unread(server_id);
+        let refreshed =
+            viewing.and_then(|channel_id| self.store.as_ref().and_then(|store| store.messages(channel_id).ok()));
         if let Some(messages) = refreshed {
             self.chat_messages = messages;
             self.chat_scroll.scroll_to_bottom();
-            cx.notify();
         }
+        cx.notify();
     }
 
     fn send_chat_message(&mut self, cx: &mut Context<Self>) {
@@ -1280,6 +1485,144 @@ impl Shell {
             .child(card)
     }
 
+    /// The Ctrl+K quick switcher overlay: a centered card with a query
+    /// input and the ranked result list. Rendered above every other overlay
+    /// (priority 2 — the add-server modal is 1).
+    fn render_quick_switcher(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.switcher_input.read(cx).content.trim().to_string();
+        let items = self.switcher_items(&query);
+        let selected = self.switcher_selected.min(items.len().saturating_sub(1));
+
+        let rows = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let is_selected = index == selected;
+                let icon = match &item.channel {
+                    Some(channel) if channel.kind == ChannelKind::Voice => {
+                        theme::icon(icons::VOLUME, px(16.)).text_color(theme::muted_foreground()).into_any_element()
+                    }
+                    Some(_) => {
+                        theme::icon(icons::HASH, px(16.)).text_color(theme::muted_foreground()).into_any_element()
+                    }
+                    None => div()
+                        .size(px(18.))
+                        .rounded_full()
+                        .bg(theme::wash_strong())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(
+                            item.server_name
+                                .trim()
+                                .chars()
+                                .next()
+                                .map(|c| c.to_uppercase().to_string())
+                                .unwrap_or_else(|| "?".to_string()),
+                        )
+                        .into_any_element(),
+                };
+                // Channels carry their server's name on the right so "which
+                // #general is this" never needs a second look.
+                let context = item.channel.is_some().then(|| {
+                    div().text_size(px(11.5)).text_color(theme::faint_foreground()).child(item.server_name.clone())
+                });
+
+                div()
+                    .id(("switcher-row", index))
+                    .h(px(36.))
+                    .px(px(10.))
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .when(is_selected, |style| style.bg(theme::wash()))
+                    .hover(|style| style.bg(theme::wash()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _, _window, cx| {
+                            shell.switcher_selected = index;
+                            shell.switcher_activate(cx);
+                        }),
+                    )
+                    .child(div().flex_none().w(px(18.)).flex().justify_center().child(icon))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(14.))
+                            .child(item.label().to_string()),
+                    )
+                    .children(context)
+            })
+            .collect::<Vec<_>>();
+
+        let empty = items.is_empty().then(|| {
+            div()
+                .py(px(16.))
+                .flex()
+                .justify_center()
+                .text_size(px(13.))
+                .text_color(theme::muted_foreground())
+                .child("No matches")
+        });
+
+        let card = div()
+            .w(px(480.))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .p(px(14.))
+            .bg(theme::popover())
+            .border_1()
+            .border_color(theme::border())
+            .rounded_xl()
+            .shadow_lg()
+            .child(self.switcher_input.clone())
+            .child(
+                div()
+                    .id("switcher-results")
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(rows)
+                    .children(empty),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(theme::faint_foreground())
+                    .child("↑↓ to navigate · Enter to jump · Esc to close"),
+            );
+
+        div()
+            .size_full()
+            .absolute()
+            .top_0()
+            .left_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(
+                div()
+                    .size_full()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .bg(theme::scrim())
+                    .on_mouse_up(MouseButton::Left, cx.listener(|shell, _, _window, cx| shell.close_switcher(cx))),
+            )
+            .child(div().mt(px(120.)).child(card))
+    }
+
     /// The server-icon rail: one bubble per saved server (initial + tooltip,
     /// with Discord's pill indicator — full height on the active one, a
     /// short hover hint on the rest) and the "+" action below a divider.
@@ -1305,6 +1648,13 @@ impl Shell {
                     .unwrap_or_else(|| "?".to_string());
                 let name: SharedString = server.link.name.clone().into();
                 let group_name: SharedString = format!("rail-server-{id}").into();
+                // Aggregate the server's channels into one rail indicator:
+                // a red count for mentions, a plain dot for mere unread.
+                let (unread_total, mention_total) =
+                    server.link.channels.iter().fold((0u32, 0u32), |totals, channel| {
+                        let (unread, mentions) = self.unread.get(&channel.id).copied().unwrap_or((0, 0));
+                        (totals.0 + unread, totals.1 + mentions)
+                    });
 
                 let pill = if is_active {
                     div()
@@ -1359,6 +1709,37 @@ impl Shell {
                             )
                             .child(initial),
                     )
+                    .children((mention_total > 0).then(|| {
+                        div()
+                            .absolute()
+                            .bottom(px(-2.))
+                            .right(px(6.))
+                            .min_w(px(18.))
+                            .h(px(18.))
+                            .px(px(4.))
+                            .rounded_full()
+                            .bg(theme::destructive())
+                            .border_2()
+                            .border_color(theme::rail())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::primary_foreground())
+                            .child(mention_total.to_string())
+                    }))
+                    .children((mention_total == 0 && unread_total > 0).then(|| {
+                        div()
+                            .absolute()
+                            .bottom(px(0.))
+                            .right(px(8.))
+                            .size(px(10.))
+                            .rounded_full()
+                            .bg(theme::foreground())
+                            .border_2()
+                            .border_color(theme::rail())
+                    }))
             })
             .collect::<Vec<_>>();
 
@@ -1530,8 +1911,11 @@ impl Shell {
             .map(|channel| {
                 let is_viewing = viewing_channel_id == Some(channel.id);
                 let channel_for_click = channel.clone();
+                let (unread_count, mention_count) = self.unread.get(&channel.id).copied().unwrap_or((0, 0));
+                let has_unread = unread_count > 0 && !is_viewing;
                 div()
                     .id(("text-channel", channel.id.as_u128() as u64))
+                    .relative()
                     .h(px(34.))
                     .mx(px(8.))
                     .px(px(8.))
@@ -1544,9 +1928,24 @@ impl Shell {
                     .when(is_viewing, |style| {
                         style.bg(theme::wash()).text_color(theme::foreground()).font_weight(FontWeight::MEDIUM)
                     })
-                    .when(!is_viewing, |style| style.text_color(theme::muted_foreground()))
+                    // Unread channels read like Discord's: full-strength
+                    // name instead of muted, plus the dot on the left edge.
+                    .when(has_unread, |style| {
+                        style.text_color(theme::foreground()).font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!is_viewing && !has_unread, |style| style.text_color(theme::muted_foreground()))
                     .hover(|style| style.bg(theme::wash()).text_color(theme::foreground()))
                     .active(|style| style.bg(theme::wash_strong()))
+                    .children(has_unread.then(|| {
+                        div()
+                            .absolute()
+                            .left(px(-8.))
+                            .top(px(13.))
+                            .w(px(4.))
+                            .h(px(8.))
+                            .rounded_r_full()
+                            .bg(theme::foreground())
+                    }))
                     .child(theme::icon(icons::HASH, px(18.)).text_color(theme::muted_foreground()))
                     .child(
                         div()
@@ -1557,6 +1956,22 @@ impl Shell {
                             .text_ellipsis()
                             .child(channel.name.clone()),
                     )
+                    .children((mention_count > 0 && !is_viewing).then(|| {
+                        div()
+                            .flex_none()
+                            .min_w(px(16.))
+                            .h(px(16.))
+                            .px(px(4.))
+                            .rounded_full()
+                            .bg(theme::destructive())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::primary_foreground())
+                            .child(mention_count.to_string())
+                    }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |shell, _, _window, cx| {
@@ -1897,6 +2312,7 @@ impl Shell {
                     .next()
                     .map(|c| c.to_uppercase().to_string())
                     .unwrap_or_else(|| "?".to_string());
+                let mentions_me = !is_self && richtext::mentions_user(&message.body, &profile_name);
 
                 div()
                     .flex()
@@ -1904,6 +2320,13 @@ impl Shell {
                     .px(px(16.))
                     .py(px(6.))
                     .hover(|style| style.bg(theme::wash()))
+                    // Discord's mention treatment: a gold wash and left
+                    // border on any row that @-mentions you.
+                    .when(mentions_me, |style| {
+                        let mut wash = theme::mention();
+                        wash.a = 0.08;
+                        style.bg(wash).border_l_2().border_color(theme::mention()).pl(px(14.))
+                    })
                     .child(div().flex_none().child(theme::avatar(avatar, initial, px(36.))))
                     .child(
                         div()
@@ -1930,7 +2353,7 @@ impl Shell {
                                             .child(format_timestamp(message.sent_at)),
                                     ),
                             )
-                            .child(div().text_size(px(14.)).child(message.body.clone())),
+                            .child(richtext::render_body(&message.body)),
                     )
             })
             .collect::<Vec<_>>();
@@ -2477,20 +2900,20 @@ impl Render for Shell {
 
         let modal = (self.profile.is_some() && self.add_server_open)
             .then(|| deferred(self.render_add_server_modal(cx)).with_priority(1));
+        let switcher = (self.profile.is_some() && self.switcher_open)
+            .then(|| deferred(self.render_quick_switcher(cx)).with_priority(2));
 
-        // F11 toggles fullscreen from anywhere in the app — registered on
-        // the outermost element so it's always an ancestor of whatever's
-        // focused (a text input, a button, ...) and sees the bubbled event.
+        // App-wide keys (F11, Ctrl+K, the open switcher's navigation) are
+        // registered on the outermost element so it's always an ancestor of
+        // whatever's focused (a text input, a button, ...) and sees the
+        // bubbled event.
         div()
             .size_full()
             .relative()
-            .on_key_down(|event, window, _cx| {
-                if event.keystroke.key == "f11" {
-                    window.toggle_fullscreen();
-                }
-            })
+            .on_key_down(cx.listener(Self::root_key_down))
             .child(content)
             .children(modal)
+            .children(switcher)
     }
 }
 

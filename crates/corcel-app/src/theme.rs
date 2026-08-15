@@ -103,6 +103,12 @@ pub fn info() -> Rgba {
     rgb(0x00a8fc)
 }
 
+/// Discord's mention gold — the wash + left border on a message row that
+/// mentions you, and the base color for `@name` pills.
+pub fn mention() -> Rgba {
+    rgb(0xfaa61a)
+}
+
 /// The dimming backdrop behind modals — the one translucent color in the
 /// theme, so it can't be built with `rgb()` like the rest.
 pub fn scrim() -> Rgba {
