@@ -302,38 +302,54 @@ pub fn mentions_user(body: &str, name: &str) -> bool {
 /// makes the clickable-link element ids unique per message — pass something
 /// stable for the message (its id), so GPUI's element state tracks across
 /// re-renders.
-pub fn render_body(seed: u64, body: &str) -> AnyElement {
+///
+/// `hidden_links` is the caller telling us which URLs render as media
+/// embeds under this message: a bare-pasted URL in that list is dropped
+/// from the text (the media speaks for itself), and a block left with
+/// nothing but whitespace disappears entirely — so a message that *is* just
+/// a GIF link shows just the GIF. Only bare URLs are dropped; a
+/// `[label](url)` link keeps its label, which is content the author wrote.
+pub fn render_body(seed: u64, body: &str, hidden_links: &[String]) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(2.))
         .text_size(px(14.))
-        .children(blocks(body).into_iter().enumerate().map(|(ix, block)| render_block(seed, ix, block)))
+        .children(
+            blocks(body)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(ix, block)| render_block(seed, ix, block, hidden_links)),
+        )
         .into_any_element()
 }
 
-fn render_block(seed: u64, ix: usize, block: Block) -> AnyElement {
+fn render_block(seed: u64, ix: usize, block: Block, hidden_links: &[String]) -> Option<AnyElement> {
     match block {
-        Block::Code(code) => div()
-            .my(px(2.))
-            .px(px(10.))
-            .py(px(8.))
-            .rounded_md()
-            .bg(theme::rail())
-            .border_1()
-            .border_color(theme::border())
-            .font_family("monospace")
-            .text_size(px(13.))
-            .child(code)
-            .into_any_element(),
-        Block::Quote(text) => div()
-            .pl(px(10.))
-            .border_l_2()
-            .border_color(theme::wash_strong())
-            .text_color(theme::muted_foreground())
-            .child(inline_text(seed, ix, &text))
-            .into_any_element(),
-        Block::Heading(level, text) => {
+        Block::Code(code) => Some(
+            div()
+                .my(px(2.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded_md()
+                .bg(theme::rail())
+                .border_1()
+                .border_color(theme::border())
+                .font_family("monospace")
+                .text_size(px(13.))
+                .child(code)
+                .into_any_element(),
+        ),
+        Block::Quote(text) => inline_text(seed, ix, &text, hidden_links).map(|inline| {
+            div()
+                .pl(px(10.))
+                .border_l_2()
+                .border_color(theme::wash_strong())
+                .text_color(theme::muted_foreground())
+                .child(inline)
+                .into_any_element()
+        }),
+        Block::Heading(level, text) => inline_text(seed, ix, &text, hidden_links).map(|inline| {
             let size = match level {
                 1 => 20.,
                 2 => 17.,
@@ -343,18 +359,24 @@ fn render_block(seed: u64, ix: usize, block: Block) -> AnyElement {
                 .mt(px(4.))
                 .text_size(px(size))
                 .font_weight(FontWeight::BOLD)
-                .child(inline_text(seed, ix, &text))
+                .child(inline)
                 .into_any_element()
-        }
-        Block::Paragraph(text) => div().child(inline_text(seed, ix, &text)).into_any_element(),
+        }),
+        Block::Paragraph(text) => inline_text(seed, ix, &text, hidden_links)
+            .map(|inline| div().child(inline).into_any_element()),
     }
 }
 
 /// One block's inline-styled text. Plain styled text when there's nothing to
 /// click; wrapped in an [`InteractiveText`] when the block contains links,
-/// so clicking a link's range opens it in the system browser.
-fn inline_text(seed: u64, block_ix: usize, source: &str) -> AnyElement {
-    let spans = parse(source);
+/// so clicking a link's range opens it in the system browser. `None` when
+/// dropping the block's embedded-media URLs (see [`render_body`]) leaves
+/// nothing visible.
+fn inline_text(seed: u64, block_ix: usize, source: &str, hidden_links: &[String]) -> Option<AnyElement> {
+    let spans = visible_spans(source, hidden_links);
+    if spans.iter().all(|span| span.text.trim().is_empty()) {
+        return None;
+    }
     let mut text = String::new();
     let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     let mut link_ranges: Vec<Range<usize>> = Vec::new();
@@ -405,16 +427,33 @@ fn inline_text(seed: u64, block_ix: usize, source: &str) -> AnyElement {
 
     let styled = StyledText::new(text).with_highlights(highlights);
     if link_urls.is_empty() {
-        return styled.into_any_element();
+        return Some(styled.into_any_element());
     }
     let id: ElementId = SharedString::from(format!("richtext-{seed:x}-{block_ix}")).into();
-    InteractiveText::new(id, styled)
-        .on_click(link_ranges, move |range_ix, _window, cx| {
-            if let Some(url) = link_urls.get(range_ix) {
-                cx.open_url(url);
-            }
+    Some(
+        InteractiveText::new(id, styled)
+            .on_click(link_ranges, move |range_ix, _window, cx| {
+                if let Some(url) = link_urls.get(range_ix) {
+                    cx.open_url(url);
+                }
+            })
+            .into_any_element(),
+    )
+}
+
+/// A block's spans minus bare URLs that render as embeds under the message.
+/// "Bare" means the visible text *is* the URL — the only case where hiding
+/// it loses nothing the author typed.
+fn visible_spans(source: &str, hidden_links: &[String]) -> Vec<Span> {
+    parse(source)
+        .into_iter()
+        .filter(|span| {
+            !span
+                .link
+                .as_deref()
+                .is_some_and(|url| span.text == url && hidden_links.iter().any(|hidden| hidden == url))
         })
-        .into_any_element()
+        .collect()
 }
 
 #[cfg(test)]
@@ -457,6 +496,21 @@ mod tests {
         assert_eq!(links[0].kind, MediaKind::Image);
         assert_eq!(links[1].url, "https://a.io/clip.mp4?t=1");
         assert_eq!(links[1].kind, MediaKind::Video);
+    }
+
+    #[test]
+    fn embedded_bare_urls_hide_but_labeled_links_stay() {
+        let hidden = vec!["https://a.io/cat.gif".to_string()];
+        // The bare paste disappears; surrounding text survives.
+        let spans = visible_spans("look https://a.io/cat.gif", &hidden);
+        assert_eq!(spans.iter().map(|s| s.text.as_str()).collect::<String>(), "look ");
+        // A labeled link keeps its label even when the URL is embedded.
+        let spans = visible_spans("[cat](https://a.io/cat.gif)", &hidden);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "cat");
+        // URLs without an embed are untouched.
+        let spans = visible_spans("https://a.io/dog.gif", &[]);
+        assert_eq!(spans[0].text, "https://a.io/dog.gif");
     }
 
     #[test]

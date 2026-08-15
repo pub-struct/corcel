@@ -630,16 +630,22 @@ impl Shell {
             .collect();
         // Embed elements are built before the row loop: building them can
         // kick off image fetches and needs `&mut self`, which the row
-        // closure can't have while it borrows the message list.
-        let mut embeds: HashMap<Uuid, Vec<gpui::AnyElement>> = {
-            let bodies: Vec<(Uuid, String)> = self
-                .chat_messages
-                .iter()
-                .filter(|message| !message.deleted)
-                .map(|message| (message.id, message.body.clone()))
-                .collect();
-            bodies.into_iter().map(|(id, body)| (id, self.render_message_embeds(&body, cx))).collect()
-        };
+        // closure can't have while it borrows the message list. The URLs
+        // that got an embed are dropped from the body text (the media
+        // speaks for itself — see `richtext::render_body`).
+        let mut embeds: HashMap<Uuid, Vec<gpui::AnyElement>> = HashMap::new();
+        let mut embedded_urls: HashMap<Uuid, Vec<String>> = HashMap::new();
+        let bodies: Vec<(Uuid, String)> = self
+            .chat_messages
+            .iter()
+            .filter(|message| !message.deleted)
+            .map(|message| (message.id, message.body.clone()))
+            .collect();
+        for (id, body) in bodies {
+            let (elements, urls) = self.render_message_embeds(&body, cx);
+            embeds.insert(id, elements);
+            embedded_urls.insert(id, urls);
+        }
         let message_rows = self
             .chat_messages
             .iter()
@@ -715,7 +721,8 @@ impl Shell {
                         )
                         .into_any_element()
                 } else {
-                    richtext::render_body(message.id.as_u128() as u64, &message.body)
+                    let hidden = embedded_urls.get(&message.id).map(Vec::as_slice).unwrap_or(&[]);
+                    richtext::render_body(message.id.as_u128() as u64, &message.body, hidden)
                 };
 
                 // Reaction chips: emoji + count, outlined in blurple when

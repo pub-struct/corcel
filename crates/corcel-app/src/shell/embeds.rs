@@ -79,28 +79,42 @@ pub(super) struct VideoEmbed {
 impl Shell {
     /// Builds the embed elements for one message body — called once per
     /// message before the row loop (it needs `&mut self`: seeing an image
-    /// URL for the first time is what kicks off its fetch).
-    pub(super) fn render_message_embeds(&mut self, body: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// URL for the first time is what kicks off its fetch). Also returns
+    /// the URLs that got an embed, so [`richtext::render_body`] can drop
+    /// them from the message text — a pasted GIF link shows just the GIF.
+    pub(super) fn render_message_embeds(
+        &mut self,
+        body: &str,
+        cx: &mut Context<Self>,
+    ) -> (Vec<AnyElement>, Vec<String>) {
         let links = richtext::media_links(body);
         let mut elements = Vec::new();
+        let mut embedded_urls = Vec::new();
         for link in links.into_iter().take(MAX_EMBEDS_PER_MESSAGE) {
             match link.kind {
                 richtext::MediaKind::Image => {
                     self.ensure_image_embed(&link.url, cx);
                     match self.image_embeds.get(&link.url) {
                         Some(ImageEmbed::Ready(image)) => {
+                            embedded_urls.push(link.url.clone());
                             elements.push(image_card(link.url, image.clone(), cx));
                         }
-                        Some(ImageEmbed::Loading) => elements.push(loading_card()),
-                        // Failed: no embed — the message still shows the
-                        // clickable link, which is the honest fallback.
+                        Some(ImageEmbed::Loading) => {
+                            embedded_urls.push(link.url);
+                            elements.push(loading_card());
+                        }
+                        // Failed: no embed and the URL stays visible in the
+                        // text — a clickable link is the honest fallback.
                         _ => {}
                     }
                 }
-                richtext::MediaKind::Video => elements.push(self.video_card(link.url, cx)),
+                richtext::MediaKind::Video => {
+                    embedded_urls.push(link.url.clone());
+                    elements.push(self.video_card(link.url, cx));
+                }
             }
         }
-        elements
+        (elements, embedded_urls)
     }
 
     /// Starts fetching an image URL the first time it's seen. The cache
