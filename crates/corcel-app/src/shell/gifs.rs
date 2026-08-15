@@ -239,6 +239,10 @@ impl Shell {
         div().absolute().bottom(px(76.)).right(px(16.)).child(
             div()
                 .id("gif-picker")
+                // Swallow every mouse event over the panel — without this,
+                // wheel scrolling the GIF grid also scrolled the chat
+                // behind the overlay.
+                .occlude()
                 .flex()
                 .flex_col()
                 .w(px(400.))
