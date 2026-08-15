@@ -196,8 +196,8 @@ pub fn bevel_ring() -> gpui::Background {
 pub fn raised_fill() -> gpui::Background {
     gpui::linear_gradient(
         180.,
-        gpui::linear_color_stop(gpui::rgba(0x242426f5), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x161617f5), 1.),
+        gpui::linear_color_stop(gpui::rgba(0x242426ff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x161617ff), 1.),
     )
 }
 
