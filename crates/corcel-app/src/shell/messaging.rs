@@ -1692,28 +1692,36 @@ impl Shell {
                     shell.maybe_send_typing(cx);
                 }
             }))
+            // The composer itself is the anchor: the input keeps its
+            // original untouched full-width layout, and the fixed-size GIF
+            // button floats over its right edge (Discord's own trick) —
+            // intermediate wrappers here collapsed the input's percent
+            // width, twice.
+            .relative()
+            .child(self.message_input.clone())
             .child(
-                div().w_full().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(self.message_input.clone())).child(
-                    div()
-                        .id("gif-picker-button")
-                        .flex_none()
-                        .px(px(10.))
-                        .py(px(8.))
-                        .rounded(px(9.))
-                        .bg(if self.gif_picker_open { theme::wash_strong() } else { theme::wash() })
-                        .border_1()
-                        .border_color(theme::border())
-                        .text_size(px(11.5))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme::muted_foreground())
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme::wash_strong()).text_color(theme::foreground()))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|shell, _, _window, cx| shell.toggle_gif_picker(cx)),
-                        )
-                        .child("GIF"),
-                ),
+                div()
+                    .id("gif-picker-button")
+                    .absolute()
+                    .right(px(24.))
+                    .bottom(px(23.))
+                    .w(px(36.))
+                    .h(px(24.))
+                    .rounded(px(7.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if self.gif_picker_open { theme::wash_strong() } else { theme::wash() })
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::muted_foreground())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::wash_strong()).text_color(theme::foreground()))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|shell, _, _window, cx| shell.toggle_gif_picker(cx)),
+                    )
+                    .child("GIF"),
             );
 
         let gif_panel = self.gif_picker_open.then(|| self.render_gif_picker(cx));

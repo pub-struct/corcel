@@ -587,6 +587,19 @@ impl Shell {
         })
         .detach();
 
+        // Dev shortcut: CORCEL_DEBUG_CHANNEL=1 opens the first server's
+        // first text channel on launch, so chat UI can be screenshotted
+        // and iterated on without clicking through navigation.
+        if std::env::var("CORCEL_DEBUG_CHANNEL").is_ok() {
+            let first = shell.servers.first().map(|server| {
+                (server.link.id, server.link.channels.iter().find(|c| c.kind == ChannelKind::Text).cloned())
+            });
+            if let Some((server_id, Some(channel))) = first {
+                shell.screen = Screen::Server { id: server_id, view: ServerView::Lobby };
+                shell.open_text_channel(channel, cx);
+            }
+        }
+
         shell
     }
 
