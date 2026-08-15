@@ -841,7 +841,7 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(theme::icon(icons::VOLUME, px(28.)).text_color(theme::muted_foreground())),
+                            .child(theme::icon(icons::GLASS_HEADPHONES, px(28.)).text_color(theme::muted_foreground())),
                     )
                     .child(
                         div()

@@ -1782,10 +1782,11 @@ impl Shell {
             .filter(|((sid, _), _)| *sid == server_id)
             .map(|(_, name)| name.clone())
             .collect();
-        // We count as online whenever our own room connection is up.
-        if self.rooms.contains_key(&server_id) {
-            online.push(profile.name.clone());
-        }
+        // This user is always in the online section: the app being open
+        // *is* their presence, and gating it on the room connection's
+        // current state made them vanish from their own member list
+        // whenever the relay was still (re)connecting.
+        online.push(profile.name.clone());
         online.sort_by_key(|name| name.to_lowercase());
         online.dedup();
 
