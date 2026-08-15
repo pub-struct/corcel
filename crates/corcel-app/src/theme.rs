@@ -1,7 +1,8 @@
 //! Color and component tokens for the "Corcel Glass" look: Discord's
 //! three-tier surface hierarchy (rail < sidebar/card < main content) kept
-//! for its UX, reskinned Frutiger-Aero-glass — translucent blue-slate
-//! surfaces over a system-blurred window, hairline light borders, azure
+//! for its UX, reskinned Frutiger-Aero-glass — translucent
+//! charcoal surfaces (the icons' own #151515-#575757 ramp) over a
+//! system-blurred window, hairline light borders, azure
 //! gradient accents, matching the Nucleo Glass icon set.
 //!
 //! GPUI's `rounded_*` presets are a fixed rem scale (sm=4px, md=6px,
@@ -17,32 +18,33 @@ use gpui::{
 
 /// The server-icon rail's background — the darkest surface.
 // ── Corcel Glass ────────────────────────────────────────────────────
-// Frutiger-Aero-descended, matched to the Nucleo Glass icon set: deep
-// blue-slate surfaces with real translucency (the window background is
+// Frutiger-Aero-descended, anchored to the Nucleo Glass icons' own
+// ramp (#151515-#575757): near-neutral charcoal surfaces, cool but
+// never blue, with real translucency (the window background is
 // system-blurred — see main.rs), hairline white borders standing in for
 // glass edges, white-wash hovers instead of gray, and azure accents.
 // Alphas are deliberate: chrome (rail) is the most transparent, floating
 // surfaces (popover) the most opaque so text always stays readable.
 
 pub fn rail() -> Rgba {
-    rgba(0x0c1019d9)
+    rgba(0x111217d9)
 }
 
 /// Channel sidebar / member list background — one step lighter than the
 /// rail.
 pub fn card() -> Rgba {
-    rgba(0x151b28d9)
+    rgba(0x1a1b21d9)
 }
 
 /// Elevated surfaces: modals, the call dock, hover profile cards.
 pub fn popover() -> Rgba {
-    rgba(0x1a2233ee)
+    rgba(0x202128ee)
 }
 
 /// Main content background (video panel, empty states) — the lightest of
 /// the three surfaces, matching Discord's chat pane.
 pub fn background() -> Rgba {
-    rgba(0x10151fdd)
+    rgba(0x15161bdd)
 }
 
 /// Hover / active row background within a sidebar or list.
@@ -80,8 +82,9 @@ pub fn faint_foreground() -> Rgba {
     rgb(0x80848e)
 }
 
-/// Discord's blurple — the app's one brand accent, used sparingly (primary
-/// buttons, the active-server rail indicator).
+/// The azure brand accent — used sparingly (primary buttons, the
+/// active-server rail indicator), always available as a gradient via
+/// [`primary_gradient`].
 pub fn primary() -> Rgba {
     rgb(0x2e8fff)
 }
@@ -170,14 +173,14 @@ pub fn primary_gradient() -> gpui::Background {
     )
 }
 
-/// The aurora ground the whole app sits on: a deep blue diagonal drift,
+/// The aurora ground the whole app sits on: a charcoal diagonal drift,
 /// visible wherever surfaces are translucent. Subtle on purpose — it
 /// tints the blur, it doesn't compete with content.
 pub fn aurora() -> gpui::Background {
     gpui::linear_gradient(
         150.,
-        gpui::linear_color_stop(gpui::rgba(0x14203add), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x0b111bdd), 1.),
+        gpui::linear_color_stop(gpui::rgba(0x24262edd), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x101115dd), 1.),
     )
 }
 
