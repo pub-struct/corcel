@@ -319,6 +319,10 @@ impl Shell {
     /// Deafen implies mute (you shouldn't be audible while you can't hear
     /// anyone); undeafen restores whatever mute state preceded it.
     pub(super) fn toggle_deafen_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_deafen(cx);
+    }
+
+    pub(super) fn toggle_deafen(&mut self, cx: &mut Context<Self>) {
         let Some(call) = self.connected_call_mut() else { return };
         if call.deafened {
             call.deafened = false;

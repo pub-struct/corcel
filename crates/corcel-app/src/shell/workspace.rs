@@ -520,7 +520,32 @@ impl Shell {
                 // the way Discord nests connected users under a voice
                 // channel.
                 let participant = is_connected.then(|| {
+                    let mute_label = if self_muted { "Unmute" } else { "Mute" };
+                    let deafen_label = if self_deafened { "Undeafen" } else { "Deafen" };
                     div()
+                        .id("vc-self-row")
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |shell, event, _window, cx| {
+                                let muted = shell.connected_call_mut().is_some_and(|call| call.muted);
+                                shell.open_context_menu(
+                                    event,
+                                    vec![
+                                        ContextMenuItem::new(
+                                            mute_label,
+                                            if muted { icons::MIC } else { icons::MIC_OFF },
+                                            ContextAction::ToggleSelfMute,
+                                        ),
+                                        ContextMenuItem::new(
+                                            deafen_label,
+                                            icons::HEADPHONE_OFF,
+                                            ContextAction::ToggleSelfDeafen,
+                                        ),
+                                    ],
+                                    cx,
+                                );
+                            }),
+                        )
                         .mx(px(8.))
                         .pl(px(26.))
                         .pr(px(8.))

@@ -47,6 +47,8 @@ impl ContextMenuItem {
 #[derive(Clone)]
 pub(super) enum ContextAction {
     MarkChannelRead { channel: Uuid },
+    ToggleSelfMute,
+    ToggleSelfDeafen,
     EditChannelName { channel: Uuid },
     AdjustUserVolume { author: String },
     KickFromVoice { author: String },
@@ -76,6 +78,13 @@ impl Shell {
                 self.mark_channel_read(channel);
                 cx.notify();
             }
+            ContextAction::ToggleSelfMute => {
+                let Some(call) = self.connected_call_mut() else { return };
+                let next = !call.muted;
+                self.set_muted(next, cx);
+                cx.notify();
+            }
+            ContextAction::ToggleSelfDeafen => self.toggle_deafen(cx),
             // Sketched, not shipped — their rows render with a "soon" chip
             // and never dispatch (see `ContextMenuItem::soon`).
             ContextAction::EditChannelName { .. }
