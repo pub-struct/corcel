@@ -179,6 +179,12 @@ pub fn glass_edge() -> Rgba {
     rgba(0xffffff2e)
 }
 
+/// The hover/selection edge: [`glass_edge`] turned up. Neutral on
+/// purpose — coss hovers brighten, they don't tint.
+pub fn edge_strong() -> Rgba {
+    rgba(0xffffff52)
+}
+
 /// The 1px "border" ring that makes a component read as 3D: light where
 /// light would hit (top), falling to shadow at the bottom. GPUI only has
 /// one border color per element, so the ring is a gradient-filled wrapper

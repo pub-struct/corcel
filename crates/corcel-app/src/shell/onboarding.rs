@@ -967,7 +967,7 @@ pub(super) fn reach_option_row(
                 ),
         );
     if selected {
-        row.border_color(theme::ring()).bg(theme::wash_strong())
+        row.border_color(theme::edge_strong()).bg(theme::wash_strong())
     } else {
         row.border_color(theme::glass_edge()).bg(theme::wash()).hover(|style| style.bg(theme::wash_strong()))
     }
@@ -996,7 +996,7 @@ pub(super) fn arrival_choice_card(
         .border_color(theme::glass_edge())
         .shadow_md()
         .cursor_pointer()
-        .hover(|style| style.border_color(theme::ring()).bg(theme::wash_strong()))
+        .hover(|style| style.border_color(theme::edge_strong()).bg(theme::wash_strong()))
         .active(|style| style.opacity(0.92))
         .child(
             div().h(px(112.)).w_full().rounded_t(px(15.)).bg(art).flex().items_center().justify_center().child(
