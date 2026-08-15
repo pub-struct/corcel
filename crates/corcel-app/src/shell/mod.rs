@@ -123,23 +123,39 @@ impl Render for VideoSurface {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match self.frames.len() {
             count if count > 0 => {
-                // Explicit rows of at most two tiles, every row and tile
-                // flex_1 — sizes come from flex distribution, never from
-                // percentage math (50% + 50% could round past the parent,
-                // wrap, and paint one feed over another). One feed fills
-                // the stage; two split it; more stack rows of two.
-                let columns = if count == 1 { 1 } else { 2 };
-                let rows: Vec<_> = self
-                    .frames
-                    .chunks(columns)
-                    .map(|row| {
-                        div().flex_1().min_h_0().flex().children(row.iter().map(|(_, frame)| {
-                            div().flex_1().min_w_0().p(px(2.)).child(
-                                img(ImageSource::Render(frame.clone()))
-                                    .size_full()
-                                    .object_fit(ObjectFit::Contain),
-                            )
-                        }))
+                // The classic call-grid layout: rows = ceil(sqrt(n)),
+                // tiles spread across rows as evenly as possible with the
+                // *smaller* rows on top — a pyramid (1 → full stage,
+                // 2 → stacked, 3 → 1 over 2, 5 → 1/2/2, 7 → 2/2/3, ...).
+                // Every tile shares one uniform width (1/widest-row) and
+                // short rows center, so nothing ever wraps or overlaps.
+                let row_count = (count as f32).sqrt().ceil() as usize;
+                let base = count / row_count;
+                let extra = count % row_count;
+                let mut row_sizes = vec![base; row_count - extra];
+                row_sizes.extend(std::iter::repeat(base + 1).take(extra));
+                let max_cols = *row_sizes.last().unwrap_or(&1) as f32;
+
+                let mut remaining = self.frames.as_slice();
+                let rows: Vec<_> = row_sizes
+                    .into_iter()
+                    .map(|size| {
+                        let (row, rest) = remaining.split_at(size);
+                        remaining = rest;
+                        div().flex_1().min_h_0().flex().justify_center().children(row.iter().map(
+                            |(_, frame)| {
+                                div()
+                                    .w(gpui::relative(1. / max_cols))
+                                    .h_full()
+                                    .min_w_0()
+                                    .p(px(2.))
+                                    .child(
+                                        img(ImageSource::Render(frame.clone()))
+                                            .size_full()
+                                            .object_fit(ObjectFit::Contain),
+                                    )
+                            },
+                        ))
                     })
                     .collect();
                 div().size_full().flex().flex_col().children(rows).into_any_element()
