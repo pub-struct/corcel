@@ -1,19 +1,20 @@
-//! The composer's GIF picker: click the GIF button, search Tenor, click a
+//! The composer's GIF picker: click the GIF button, search GIPHY, click a
 //! result and it lands in the channel as a message whose body is the GIF's
 //! URL — the existing media-embed pipeline renders it inline for everyone
 //! (including old builds, which already embed linked GIFs).
 //!
-//! Search needs a Tenor v2 API key (free, via Google Cloud). It's read
-//! from the `tenor.key` file next to `profile.json`, or the
-//! `CORCEL_TENOR_KEY` env var; without one the picker opens to
+//! Search runs on GIPHY (Tenor's API was closed to new consumers by
+//! Google — "not available to this consumer"). The free API key is read
+//! from the `giphy.key` file next to `profile.json`, or the
+//! `CORCEL_GIPHY_KEY` env var; without one the picker opens to
 //! instructions instead of results.
 
 use std::io::Read;
 
 use super::*;
 
-const TENOR_SEARCH: &str = "https://tenor.googleapis.com/v2/search";
-const TENOR_FEATURED: &str = "https://tenor.googleapis.com/v2/featured";
+const GIPHY_SEARCH: &str = "https://api.giphy.com/v1/gifs/search";
+const GIPHY_TRENDING: &str = "https://api.giphy.com/v1/gifs/trending";
 const RESULT_LIMIT: usize = 24;
 
 /// One search hit: the lightweight preview the grid renders and the full
@@ -24,43 +25,45 @@ pub(super) struct GifResult {
     pub full: String,
 }
 
-fn tenor_key() -> Option<String> {
-    if let Ok(key) = std::env::var("CORCEL_TENOR_KEY") {
+fn giphy_key() -> Option<String> {
+    if let Ok(key) = std::env::var("CORCEL_GIPHY_KEY") {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Some(key);
         }
     }
-    let path = crate::profile::config_dir().join("tenor.key");
+    let path = crate::profile::config_dir().join("giphy.key");
     let key = std::fs::read_to_string(path).ok()?.trim().to_string();
     (!key.is_empty()).then_some(key)
 }
 
-/// Blocking Tenor call — parked on the blocking pool by the caller, same
+/// Blocking GIPHY call — parked on the blocking pool by the caller, same
 /// pattern as the image-embed fetches.
 fn fetch_gifs(key: &str, query: &str) -> anyhow::Result<Vec<GifResult>> {
-    let endpoint = if query.is_empty() { TENOR_FEATURED } else { TENOR_SEARCH };
+    let endpoint = if query.is_empty() { GIPHY_TRENDING } else { GIPHY_SEARCH };
     let mut request = ureq::get(endpoint)
         .timeout(Duration::from_secs(15))
-        .query("key", key)
+        .query("api_key", key)
         .query("limit", &RESULT_LIMIT.to_string())
-        .query("media_filter", "tinygif,gif");
+        .query("rating", "pg-13");
     if !query.is_empty() {
         request = request.query("q", query);
     }
     let mut body = String::new();
     request.call()?.into_reader().take(4 * 1024 * 1024).read_to_string(&mut body)?;
     let json: serde_json::Value = serde_json::from_str(&body)?;
-    let results = json["results"]
+    let results = json["data"]
         .as_array()
         .map(|results| {
             results
                 .iter()
                 .filter_map(|hit| {
-                    let formats = &hit["media_formats"];
-                    let full = formats["gif"]["url"].as_str()?.to_string();
-                    let preview =
-                        formats["tinygif"]["url"].as_str().map(str::to_string).unwrap_or_else(|| full.clone());
+                    let images = &hit["images"];
+                    let full = images["original"]["url"].as_str()?.to_string();
+                    let preview = images["fixed_height_small"]["url"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| full.clone());
                     Some(GifResult { preview, full })
                 })
                 .collect()
@@ -78,12 +81,12 @@ impl Shell {
         }
         self.gif_picker_open = true;
         self.gif_error = None;
-        if tenor_key().is_none() {
+        if giphy_key().is_none() {
             self.gif_results.clear();
             cx.notify();
             return;
         }
-        // Open on Tenor's featured feed so the panel is never blank while
+        // Open on GIPHY's trending feed so the panel is never blank while
         // the user thinks of a search.
         if self.gif_results.is_empty() {
             self.search_gifs(String::new(), cx);
@@ -92,7 +95,7 @@ impl Shell {
     }
 
     pub(super) fn search_gifs(&mut self, query: String, cx: &mut Context<Self>) {
-        let Some(key) = tenor_key() else { return };
+        let Some(key) = giphy_key() else { return };
         self.gif_loading = true;
         self.gif_error = None;
         cx.notify();
@@ -122,7 +125,7 @@ impl Shell {
     /// The panel floating above the composer: a query field and the result
     /// grid (previews go through the same image cache the embeds use).
     pub(super) fn render_gif_picker(&mut self, cx: &mut Context<Self>) -> Div {
-        let has_key = tenor_key().is_some();
+        let has_key = giphy_key().is_some();
 
         let body: AnyElement = if !has_key {
             div()
@@ -133,12 +136,12 @@ impl Shell {
                 .text_size(px(12.5))
                 .text_color(theme::muted_foreground())
                 .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::foreground()).child(
-                    "GIF search needs a (free) Tenor API key",
+                    "GIF search needs a (free) GIPHY API key",
                 ))
-                .child("1. Create a key at developers.google.com/tenor (Google Cloud, free tier).")
+                .child("1. Create an app at developers.giphy.com (free, instant key).")
                 .child(format!(
-                    "2. Save it as {} — one line, just the key.",
-                    crate::profile::config_dir().join("tenor.key").display()
+                    "2. Save the key as {} — one line, just the key.",
+                    crate::profile::config_dir().join("giphy.key").display()
                 ))
                 .child("3. Reopen this picker.")
                 .into_any_element()

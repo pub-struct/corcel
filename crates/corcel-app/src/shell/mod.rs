@@ -534,7 +534,7 @@ impl Shell {
             mention_selected: 0,
             context_menu: None,
             gif_picker_open: false,
-            gif_input: cx.new(|cx| TextInput::new("Search Tenor…", cx)),
+            gif_input: cx.new(|cx| TextInput::new("Search GIPHY…", cx)),
             gif_results: Vec::new(),
             gif_loading: false,
             gif_error: None,
