@@ -7,8 +7,8 @@ use super::*;
 /// Fixed widths of the shell's chrome columns. Shared constants so nothing
 /// (like the old call dock's `72 + 240 - 24` magic width) can silently desync
 /// from the columns it's aligned against.
-const RAIL_WIDTH: f32 = 72.;
-const SIDEBAR_WIDTH: f32 = 240.;
+const RAIL_WIDTH: f32 = 60.;
+const SIDEBAR_WIDTH: f32 = 288.;
 
 impl Shell {
     pub(super) fn copy_link_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -125,8 +125,8 @@ impl Shell {
                     .child(
                         div()
                             .id(("rail-server", id.as_u128() as u64))
-                            .size(px(48.))
-                            .rounded(if is_active { px(16.) } else { px(24.) })
+                            .size(px(44.))
+                            .rounded(if is_active { px(14.) } else { px(22.) })
                             .bg(if is_active { theme::primary() } else { theme::card() })
                             .flex()
                             .items_center()
@@ -232,7 +232,7 @@ impl Shell {
             .child(
                 div()
                     .id("rail-add-server")
-                    .size(px(48.))
+                    .size(px(44.))
                     .rounded(px(24.))
                     .bg(theme::card())
                     .flex()
