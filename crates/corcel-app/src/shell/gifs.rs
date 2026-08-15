@@ -94,8 +94,31 @@ impl Shell {
         cx.notify();
     }
 
+    /// Search-as-you-type: bump the generation and schedule a search a
+    /// beat later; only the newest keystroke's timer actually fires, and
+    /// it reads the input fresh so it always searches what's on screen.
+    pub(super) fn gif_query_changed(&mut self, cx: &mut Context<Self>) {
+        self.gif_search_generation += 1;
+        let generation = self.gif_search_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(350)).await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.gif_search_generation != generation || !shell.gif_picker_open {
+                    return;
+                }
+                let query = shell.gif_input.read(cx).content.trim().to_string();
+                if query == shell.gif_last_query {
+                    return;
+                }
+                shell.search_gifs(query, cx);
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn search_gifs(&mut self, query: String, cx: &mut Context<Self>) {
         let Some(key) = giphy_key() else { return };
+        self.gif_last_query = query.clone();
         self.gif_loading = true;
         self.gif_error = None;
         cx.notify();
@@ -238,8 +261,12 @@ impl Shell {
                         .border_color(theme::border())
                         .on_key_down(cx.listener(|shell, event: &KeyDownEvent, _window, cx| {
                             if event.keystroke.key == "enter" {
+                                // Enter skips the debounce.
+                                shell.gif_search_generation += 1;
                                 let query = shell.gif_input.read(cx).content.trim().to_string();
                                 shell.search_gifs(query, cx);
+                            } else {
+                                shell.gif_query_changed(cx);
                             }
                         }))
                         .child(self.gif_input.clone()),

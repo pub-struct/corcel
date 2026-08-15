@@ -454,6 +454,13 @@ pub(crate) struct Shell {
     gif_results: Vec<GifResult>,
     gif_loading: bool,
     gif_error: Option<String>,
+    /// Debounce generation for search-as-you-type: each keystroke bumps
+    /// it and schedules a search 350ms out that only fires if it's still
+    /// the newest (see [`gifs`]).
+    gif_search_generation: u64,
+    /// The last query actually searched, so settling on the same text
+    /// doesn't refetch.
+    gif_last_query: String,
     /// The open right-click menu, if any (see [`context_menu`]).
     context_menu: Option<ContextMenu>,
     /// Which row of the composer's @mention autocomplete is highlighted.
@@ -538,6 +545,8 @@ impl Shell {
             gif_results: Vec::new(),
             gif_loading: false,
             gif_error: None,
+            gif_search_generation: 0,
+            gif_last_query: String::new(),
             reacting_to: None,
             chat_reactions: HashMap::new(),
             image_embeds: HashMap::new(),
