@@ -8,6 +8,7 @@
 //! one [`Store`]); background tasks that need the database route through
 //! entity updates rather than sharing the connection across threads.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -81,6 +82,10 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (message_id, emoji, author)
     );
     CREATE INDEX reactions_by_time ON reactions (at);",
+    // 4: threads — a reply-in-thread is a normal message pointing at the
+    // channel message its thread hangs off (see `ChatMessage::thread_root`).
+    "ALTER TABLE messages ADD COLUMN thread_root TEXT;
+    CREATE INDEX messages_by_thread ON messages (thread_root, sent_at);",
 ];
 
 impl Store {
@@ -190,8 +195,8 @@ impl Store {
     pub fn insert_message(&self, server_id: Uuid, message: &ChatMessage) -> anyhow::Result<bool> {
         let changed = self.conn.execute(
             "INSERT INTO messages (id, server_id, channel_id, author, sent_at, body,
-                                   reply_to, edited_at, deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                                   reply_to, edited_at, deleted, thread_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                  body      = excluded.body,
                  edited_at = excluded.edited_at,
@@ -208,6 +213,7 @@ impl Store {
                 message.reply_to.map(|id| id.to_string()),
                 message.edited_at,
                 message.deleted,
+                message.thread_root.map(|id| id.to_string()),
             ],
         )?;
         Ok(changed > 0)
@@ -319,19 +325,56 @@ impl Store {
 
     /// A channel's messages in display order.
     pub fn messages(&self, channel: ChannelId) -> anyhow::Result<Vec<ChatMessage>> {
+        // Thread replies live only in their thread's panel — the channel
+        // scrollback stays clean (see `ChatMessage::thread_root`).
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel_id, author, sent_at, body, reply_to, edited_at, deleted
-             FROM messages WHERE channel_id = ?1 ORDER BY sent_at, id",
+            "SELECT id, channel_id, author, sent_at, body, reply_to, edited_at, deleted, thread_root
+             FROM messages WHERE channel_id = ?1 AND thread_root IS NULL ORDER BY sent_at, id",
         )?;
         let rows = stmt.query_map(params![channel.to_string()], row_to_message)?;
         Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Every message of one thread, oldest first.
+    pub fn thread_messages(&self, root: Uuid) -> anyhow::Result<Vec<ChatMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, channel_id, author, sent_at, body, reply_to, edited_at, deleted, thread_root
+             FROM messages WHERE thread_root = ?1 ORDER BY sent_at, id",
+        )?;
+        let rows = stmt.query_map(params![root.to_string()], row_to_message)?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Per-thread `(reply count, newest reply sent_at)` for every thread
+    /// rooted in a channel — what draws the "N replies" chip under the
+    /// root message. Deleted replies don't count.
+    pub fn thread_summaries(&self, channel: ChannelId) -> anyhow::Result<HashMap<Uuid, (u32, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT thread_root, COUNT(*), MAX(sent_at) FROM messages
+             WHERE channel_id = ?1 AND thread_root IS NOT NULL AND deleted = 0
+             GROUP BY thread_root",
+        )?;
+        let rows = stmt.query_map(params![channel.to_string()], |row| {
+            let root: String = row.get(0)?;
+            let count: u32 = row.get(1)?;
+            let last_at: i64 = row.get(2)?;
+            Ok((root, count, last_at))
+        })?;
+        let mut summaries = HashMap::new();
+        for row in rows.flatten() {
+            let (root, count, last_at) = row;
+            if let Ok(root) = root.parse() {
+                summaries.insert(root, (count, last_at));
+            }
+        }
+        Ok(summaries)
     }
 
     /// Every message of a server newer than `since` — what a peer sends back
     /// for a [`crate::chat::ChatPayload::HistoryRequest`].
     pub fn messages_since(&self, server_id: Uuid, since: i64) -> anyhow::Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel_id, author, sent_at, body, reply_to, edited_at, deleted
+            "SELECT id, channel_id, author, sent_at, body, reply_to, edited_at, deleted, thread_root
              FROM messages WHERE server_id = ?1 AND sent_at > ?2 ORDER BY sent_at, id",
         )?;
         let rows = stmt.query_map(params![server_id.to_string(), since], row_to_message)?;
@@ -398,6 +441,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
     let id: String = row.get(0)?;
     let channel: String = row.get(1)?;
     let reply_to: Option<String> = row.get(5)?;
+    let thread_root: Option<String> = row.get(8)?;
     Ok(ChatMessage {
         id: id.parse().unwrap_or_else(|_| Uuid::nil()),
         channel: channel.parse().unwrap_or_else(|_| Uuid::nil()),
@@ -407,6 +451,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
         reply_to: reply_to.and_then(|id| id.parse().ok()),
         edited_at: row.get(6)?,
         deleted: row.get(7)?,
+        thread_root: thread_root.and_then(|id| id.parse().ok()),
     })
 }
 

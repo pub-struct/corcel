@@ -420,6 +420,20 @@ pub(crate) struct Shell {
     editing: Option<(Uuid, Entity<TextInput>)>,
     /// The message whose inline emoji palette is open, if any.
     reacting_to: Option<Uuid>,
+    /// The thread open in the right-hand panel: the root (channel) message
+    /// it hangs off, or `None` when no thread is open. Slack-style — a
+    /// thread is implied by replies carrying `thread_root`, not an entity
+    /// (see [`chat::ChatMessage::thread_root`]).
+    open_thread: Option<ChatMessage>,
+    /// The open thread's replies, oldest first. Loaded from the store when
+    /// the panel opens and refreshed as replies arrive.
+    thread_messages: Vec<ChatMessage>,
+    /// Per-root `(reply count, newest reply sent_at)` for the on-screen
+    /// channel — draws the "N replies" chip under thread roots. Derived
+    /// from the store, never replicated, so peers can't diverge on it.
+    thread_counts: HashMap<Uuid, (u32, i64)>,
+    /// The thread panel's composer.
+    thread_input: Entity<TextInput>,
     /// Live reactions of the on-screen text channel: message → chips in
     /// first-reacted order, each an emoji with everyone who reacted with it.
     /// Rebuilt from the store whenever the channel (re)loads or a reaction
@@ -487,6 +501,10 @@ impl Shell {
             encoded_avatar: None,
             replying_to: None,
             editing: None,
+            open_thread: None,
+            thread_messages: Vec::new(),
+            thread_counts: HashMap::new(),
+            thread_input: cx.new(|cx| TextInput::new("Reply in thread…", cx)),
             reacting_to: None,
             chat_reactions: HashMap::new(),
             image_embeds: HashMap::new(),
@@ -693,6 +711,8 @@ impl Shell {
                     self.cancel_edit(cx);
                 } else if self.reacting_to.take().is_some() || self.replying_to.take().is_some() {
                     cx.notify();
+                } else if self.open_thread.is_some() {
+                    self.close_thread(cx);
                 }
             }
             return;

@@ -78,6 +78,7 @@ impl Shell {
         self.reset_composer_state();
         self.stop_video_embeds(cx);
         self.reload_reactions(channel.id);
+        self.refresh_threads(channel.id);
         self.mark_channel_read(channel.id);
         self.screen = Screen::Server { id, view: ServerView::Text { channel } };
         self.chat_scroll.scroll_to_bottom();
@@ -92,6 +93,8 @@ impl Shell {
         self.editing = None;
         self.reacting_to = None;
         self.chat_reactions.clear();
+        self.open_thread = None;
+        self.thread_messages.clear();
     }
 
     /// Rebuilds [`Shell::chat_reactions`] for a channel from the store's
@@ -494,6 +497,11 @@ impl Shell {
             self.chat_messages = messages;
             self.chat_scroll.scroll_to_bottom();
         }
+        // Thread replies don't appear in the scrollback, but they change
+        // the "N replies" chips and the open panel.
+        if let Some(channel_id) = viewing {
+            self.refresh_threads(channel_id);
+        }
         cx.notify();
     }
 
@@ -682,6 +690,7 @@ impl Shell {
             reply_to: self.replying_to.take().map(|original| original.id),
             edited_at: None,
             deleted: false,
+            thread_root: None,
         };
 
         // Local first: the message is durably ours before the network hears
@@ -697,6 +706,80 @@ impl Shell {
         self.last_typing_sent = None;
         self.message_input.update(cx, |input, cx| input.clear(cx));
         self.chat_scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// Opens `root`'s thread in the right-hand panel (replacing the member
+    /// panel while open) and loads its replies. If the clicked message is
+    /// itself a thread reply this flattens to its root — threads are one
+    /// level deep, always (Slack's rule).
+    pub(super) fn open_thread(&mut self, root: ChatMessage, cx: &mut Context<Self>) {
+        let root = match root.thread_root {
+            Some(root_id) => self
+                .chat_messages
+                .iter()
+                .find(|message| message.id == root_id)
+                .cloned()
+                .unwrap_or(root),
+            None => root,
+        };
+        self.thread_messages =
+            self.store.as_ref().and_then(|store| store.thread_messages(root.id).ok()).unwrap_or_default();
+        self.open_thread = Some(root);
+        cx.notify();
+    }
+
+    pub(super) fn close_thread(&mut self, cx: &mut Context<Self>) {
+        if self.open_thread.take().is_some() {
+            self.thread_messages.clear();
+            cx.notify();
+        }
+    }
+
+    /// Reloads the on-screen channel's per-thread reply counts (see
+    /// [`Shell::thread_counts`]) and, if a thread panel is open, its
+    /// replies — called whenever stored messages change.
+    pub(super) fn refresh_threads(&mut self, channel: Uuid) {
+        self.thread_counts = self
+            .store
+            .as_ref()
+            .and_then(|store| store.thread_summaries(channel).ok())
+            .unwrap_or_default();
+        if let Some(root) = &self.open_thread {
+            self.thread_messages =
+                self.store.as_ref().and_then(|store| store.thread_messages(root.id).ok()).unwrap_or_default();
+        }
+    }
+
+    /// Sends the thread composer's draft as a reply in the open thread —
+    /// a normal message with `thread_root` set, stored and broadcast
+    /// exactly like [`Self::send_chat_message`]'s.
+    pub(super) fn send_thread_message(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.open_thread.clone() else { return };
+        let body = self.thread_input.read(cx).content.trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        let Some((server_id, _)) = self.visible_text_channel() else { return };
+        let author = self.profile.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "?".to_string());
+        let message = ChatMessage {
+            id: Uuid::new_v4(),
+            channel: root.channel,
+            author,
+            sent_at: chat::now_millis(),
+            body,
+            reply_to: None,
+            edited_at: None,
+            deleted: false,
+            thread_root: Some(root.id),
+        };
+        if let Some(store) = &self.store {
+            let _ = store.insert_message(server_id, &message);
+        }
+        self.send_room(server_id, ChatPayload::Message(message.clone()), None);
+        self.thread_messages.push(message);
+        self.refresh_threads(root.channel);
+        self.thread_input.update(cx, |input, cx| input.clear(cx));
         cx.notify();
     }
 
@@ -1103,11 +1186,61 @@ impl Shell {
                     )
                 });
 
+                // The Slack-style thread indicator: "N replies · last at"
+                // under any message a thread hangs off. Click to open the
+                // panel. Derived counts only — nothing stored on the root.
+                let thread_chip = (!message.deleted)
+                    .then(|| self.thread_counts.get(&message_id).copied())
+                    .flatten()
+                    .map(|(count, last_at)| {
+                        let root_for_click = message.clone();
+                        div().flex().mt(px(2.)).child(
+                            div()
+                                .id(SharedString::from(format!("thread-chip-{message_id}")))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(8.))
+                                .py(px(3.))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::wash_strong()))
+                                .child(
+                                    theme::icon(icons::MESSAGE_SQUARE, px(13.))
+                                        .text_color(theme::primary()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::primary())
+                                        .child(if count == 1 {
+                                            "1 reply".to_string()
+                                        } else {
+                                            format!("{count} replies")
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme::muted_foreground())
+                                        .child(format_timestamp(last_at)),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |shell, _, _window, cx| {
+                                        shell.open_thread(root_for_click.clone(), cx);
+                                    }),
+                                ),
+                        )
+                    });
+
                 // The hover action bar: reply + react on every message,
                 // edit/delete only on this user's own. Deleted messages get
                 // no actions at all.
                 let actions = (!message.deleted).then(|| {
                     let reply_message = message.clone();
+                    let thread_message = message.clone();
                     let edit_message = message.clone();
                     let mut bar = div()
                         .absolute()
@@ -1127,6 +1260,12 @@ impl Shell {
                             MouseButton::Left,
                             cx.listener(move |shell, _, window, cx| {
                                 shell.start_reply(reply_message.clone(), window, cx);
+                            }),
+                        ))
+                        .child(message_action(icons::MESSAGE_SQUARE, false).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _window, cx| {
+                                shell.open_thread(thread_message.clone(), cx);
                             }),
                         ))
                         .child(message_action(icons::SMILE_PLUS, false).on_mouse_up(
@@ -1209,6 +1348,7 @@ impl Shell {
                             .child(body)
                             .children(embeds.remove(&message.id).unwrap_or_default())
                             .children(chips)
+                            .children(thread_chip)
                             .children(palette),
                     )
             })
@@ -1324,13 +1464,149 @@ impl Shell {
             .children(reply_bar)
             .child(composer);
 
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
+        // The thread panel takes the member panel's slot while open —
+        // both at once would crowd the chat out of narrow windows.
+        let side_panel = match self.open_thread.clone() {
+            Some(root) => self.render_thread_panel(root, profile, cx),
+            None => self.render_member_panel(profile, cx),
+        };
+
+        div().flex_1().min_w_0().h_full().flex().child(chat_column).child(side_panel)
+    }
+
+    /// The Slack-style thread panel: the root message in full on top, its
+    /// replies below, and a composer of its own — the channel stays
+    /// visible and usable to its left.
+    fn render_thread_panel(&mut self, root: ChatMessage, profile: &Profile, cx: &mut Context<Self>) -> Div {
+        let render_entry = |shell: &Self, message: &ChatMessage, is_root: bool| {
+            let is_self = message.author == profile.name;
+            let avatar = if is_self {
+                profile.avatar_path.clone()
+            } else {
+                shell.peer_avatars.get(&message.author).cloned()
+            };
+            let initial = message
+                .author
+                .trim()
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let body: AnyElement = if message.deleted {
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme::faint_foreground())
+                    .italic()
+                    .child("message deleted")
+                    .into_any_element()
+            } else {
+                div().text_size(px(13.5)).child(message.body.clone()).into_any_element()
+            };
+            div()
+                .px(px(12.))
+                .py(px(6.))
+                .flex()
+                .gap(px(8.))
+                .when(is_root, |entry| entry.pb(px(10.)))
+                .child(div().flex_none().child(theme::avatar(avatar, initial, px(28.))))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex()
+                                .items_baseline()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(message.author.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(theme::faint_foreground())
+                                        .child(format_timestamp(message.sent_at)),
+                                ),
+                        )
+                        .child(body),
+                )
+        };
+
+        let reply_count = self.thread_messages.len();
+        let replies: Vec<_> =
+            self.thread_messages.iter().map(|message| render_entry(self, message, false)).collect();
+
+        let header = div()
+            .h(px(44.))
+            .flex_none()
+            .px(px(12.))
+            .border_b_1()
+            .border_color(theme::border())
             .flex()
-            .child(chat_column)
-            .child(self.render_member_panel(profile, cx))
+            .items_center()
+            .justify_between()
+            .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).child("Thread"))
+            .child(
+                theme::icon_button("close-thread", icons::X, "Close thread").on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _, _window, cx| shell.close_thread(cx)),
+                ),
+            );
+
+        let divider = div()
+            .px(px(12.))
+            .py(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(div().text_size(px(11.)).text_color(theme::muted_foreground()).child(if reply_count == 1 {
+                "1 reply".to_string()
+            } else {
+                format!("{reply_count} replies")
+            }))
+            .child(div().flex_1().h(px(1.)).bg(theme::border()));
+
+        let composer = div()
+            .flex_none()
+            .px(px(10.))
+            .pb(px(10.))
+            .pt(px(4.))
+            .on_key_down(cx.listener(|shell, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "enter" {
+                    shell.send_thread_message(cx);
+                }
+            }))
+            .child(self.thread_input.clone());
+
+        div()
+            .w(px(320.))
+            .h_full()
+            .flex_none()
+            .border_l_1()
+            .border_color(theme::border())
+            .bg(theme::card())
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("thread-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .pt(px(6.))
+                    .child(render_entry(self, &root, true))
+                    .child(divider)
+                    .children(replies),
+            )
+            .child(composer)
     }
 
     /// The member panel on a text channel's right edge. A serverless

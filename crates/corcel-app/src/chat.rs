@@ -39,6 +39,15 @@ pub struct ChatMessage {
     /// old builds' payloads (which lack the field) deserializing.
     #[serde(default)]
     pub reply_to: Option<Uuid>,
+    /// The thread this message lives in — the id of the channel message
+    /// the thread hangs off (Slack-style: threads are anchored to a
+    /// message, not separate channels). `None` means a normal channel
+    /// message; `Some` messages render only inside their thread's panel,
+    /// while replicating exactly like any other message. Old builds don't
+    /// know the field and will show thread replies inline in the channel
+    /// — degraded but lossless.
+    #[serde(default)]
+    pub thread_root: Option<Uuid>,
     /// When the author last edited this message (unix millis). `None` means
     /// never edited; larger always wins when merging (last-writer-wins).
     #[serde(default)]
