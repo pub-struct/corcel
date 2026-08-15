@@ -27,18 +27,18 @@ use gpui::{
 // surfaces (popover) the most opaque so text always stays readable.
 
 pub fn rail() -> Rgba {
-    rgba(0x111112d9)
+    rgba(0x111111d9)
 }
 
 /// Channel sidebar / member list background — one step lighter than the
 /// rail.
 pub fn card() -> Rgba {
-    rgba(0x18181ad9)
+    rgba(0x181818d9)
 }
 
 /// Elevated surfaces: modals, the call dock, hover profile cards.
 pub fn popover() -> Rgba {
-    rgba(0x1e1e20f2)
+    rgba(0x1d1d1df2)
 }
 
 /// Main content background (chat, video panel, empty states). Opaque on
@@ -46,7 +46,7 @@ pub fn popover() -> Rgba {
 /// chrome floating *above* content — content itself stays a solid, calm
 /// ground the glass can refract.
 pub fn background() -> Rgba {
-    rgb(0x121213)
+    rgb(0x121212)
 }
 
 /// Hover / active row background within a sidebar or list.
@@ -170,7 +170,7 @@ pub fn pill(variant: PillVariant, label: impl Into<SharedString>) -> Div {
 /// shows through the pane, per Apple's "controls float above content"
 /// layer model. Pair with [`glass_edge`] for the light rim.
 pub fn glass() -> Rgba {
-    rgba(0x1e2027a8)
+    rgba(0x1d1d1da8)
 }
 
 /// The hairline light rim of a glass pane — brighter than [`border`], it
@@ -196,8 +196,8 @@ pub fn bevel_ring() -> gpui::Background {
 pub fn raised_fill() -> gpui::Background {
     gpui::linear_gradient(
         180.,
-        gpui::linear_color_stop(gpui::rgba(0x242426ff), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x161617ff), 1.),
+        gpui::linear_color_stop(gpui::rgba(0x232323ff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x151515ff), 1.),
     )
 }
 
@@ -217,7 +217,7 @@ pub fn primary_gradient() -> gpui::Background {
     gpui::linear_gradient(
         180.,
         gpui::linear_color_stop(gpui::rgba(0xffffffff), 0.),
-        gpui::linear_color_stop(gpui::rgba(0xdededfff), 1.),
+        gpui::linear_color_stop(gpui::rgba(0xdededeff), 1.),
     )
 }
 
@@ -227,7 +227,7 @@ pub fn primary_ring() -> gpui::Background {
     gpui::linear_gradient(
         180.,
         gpui::linear_color_stop(gpui::rgba(0xffffffff), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x8a8a8fff), 1.),
+        gpui::linear_color_stop(gpui::rgba(0x8a8a8aff), 1.),
     )
 }
 
@@ -237,8 +237,8 @@ pub fn primary_ring() -> gpui::Background {
 pub fn aurora() -> gpui::Background {
     gpui::linear_gradient(
         150.,
-        gpui::linear_color_stop(gpui::rgba(0x1b1b1dff), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x0f0f10ff), 1.),
+        gpui::linear_color_stop(gpui::rgba(0x1a1a1aff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x0f0f0fff), 1.),
     )
 }
 
