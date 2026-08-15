@@ -57,10 +57,11 @@ async fn client_endpoint() -> anyhow::Result<&'static Endpoint> {
         .await
 }
 
-/// Connects to the relay at `relay`, immediately sends `initial` (the
-/// role-declaring hello — Host/Join/Watch/Room), and returns the channel
-/// pair for everything after.
-pub async fn connect(relay: EndpointId, initial: ClientMessage) -> anyhow::Result<Connection> {
+/// Opens a raw QUIC connection to the relay at `relay` for the given ALPN,
+/// going over loopback when the relay lives in this same process (see
+/// [`LOCAL_RELAYS`]). This is what `corcel-net` dials media connections
+/// with; [`connect`] wraps it for the room protocol.
+pub async fn dial(relay: EndpointId, alpn: &[u8]) -> anyhow::Result<iroh::endpoint::Connection> {
     let endpoint = client_endpoint().await?;
     let addr = LOCAL_RELAYS
         .lock()
@@ -68,7 +69,14 @@ pub async fn connect(relay: EndpointId, initial: ClientMessage) -> anyhow::Resul
         .get(&relay)
         .cloned()
         .unwrap_or_else(|| EndpointAddr::from(relay));
-    let conn = endpoint.connect(addr, ALPN).await?;
+    Ok(endpoint.connect(addr, alpn).await?)
+}
+
+/// Connects to the relay at `relay`, immediately sends `initial` (the
+/// role-declaring hello — [`ClientMessage::Room`]), and returns the channel
+/// pair for everything after.
+pub async fn connect(relay: EndpointId, initial: ClientMessage) -> anyhow::Result<Connection> {
+    let conn = dial(relay, ALPN).await?;
     let (mut writer, reader) = conn.open_bi().await?;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ClientMessage>();

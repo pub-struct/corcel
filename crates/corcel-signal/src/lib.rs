@@ -1,6 +1,6 @@
-//! Ephemeral signaling over iroh: carries SDP/ICE handshake messages (and
-//! room chat payloads) only, hosted by whichever peer created the server
-//! (see PROJECT.md, decision 1).
+//! Each server's rendezvous point over iroh: the relay every member's chat
+//! room connection and call-media connection dials, hosted by whichever
+//! peer created the server (see PROJECT.md, decision 1).
 //!
 //! [`relay`] is run by the host; [`client`] is used by everyone connecting
 //! to it (including the host connecting to itself — see
@@ -14,5 +14,5 @@ pub mod protocol;
 pub mod relay;
 
 pub use iroh::EndpointId;
-pub use protocol::{ChannelId, ClientMessage, PeerId, ServerMessage, SignalPayload};
+pub use protocol::{ChannelId, ClientMessage, PeerId, ServerMessage};
 pub use relay::RelayIdentity;

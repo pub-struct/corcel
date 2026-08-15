@@ -1,13 +1,14 @@
-//! The host side of a server's signaling relay, served over iroh.
+//! The host side of a server's relay, served over iroh.
 //!
 //! When a peer starts hosting a server, it spawns one of these locally. It
-//! knows nothing about SDP/ICE semantics — it just routes opaque
-//! [`SignalPayload`](crate::protocol::SignalPayload)s between the host and
-//! whichever participants are currently signaling for a given channel, and
-//! gets out of the way once each pair has what it needs to connect directly.
-//! It also hosts *rooms* (see [`ClientMessage::Room`]): hostless membership
-//! sets used as the chat mesh, where it broadcasts/routes opaque JSON
-//! payloads with the same "never inspect, only deliver" contract.
+//! serves two ALPNs on one endpoint (one identity, one invite link):
+//!
+//! - [`ALPN`]: *rooms* (see [`ClientMessage::Room`]) — hostless membership
+//!   sets used as the chat mesh, where it broadcasts/routes opaque JSON
+//!   payloads with a "never inspect, only deliver" contract.
+//! - [`MEDIA_ALPN`]: call media. The relay doesn't handle these connections
+//!   itself — they're handed whole to the caller via [`Relay::media`], and
+//!   `corcel-net`'s host relay forwards RTP between them.
 //!
 //! Transport is an [`iroh`] endpoint rather than a plain socket, which is
 //! what makes invite links work across the open internet with zero user
@@ -33,10 +34,15 @@ use uuid::Uuid;
 
 use crate::protocol::{ChannelId, ClientMessage, PeerId, ServerMessage};
 
-/// The ALPN this relay accepts. Bump the trailing number on any wire-format
-/// break — iroh refuses mismatched ALPNs at handshake, which beats a JSON
-/// parse error deep into a session.
+/// The ALPN for room (chat/presence) connections. Bump the trailing number
+/// on any wire-format break — iroh refuses mismatched ALPNs at handshake,
+/// which beats a JSON parse error deep into a session.
 pub const ALPN: &[u8] = b"corcel/signal/1";
+
+/// The ALPN for call-media connections (RTP over QUIC datagrams). The relay
+/// only routes these to [`Relay::media`]; the wire protocol on them belongs
+/// to `corcel-net`.
+pub const MEDIA_ALPN: &[u8] = b"corcel/media/1";
 
 pub struct Relay {
     /// What invite links carry — the stable, publicly-dialable identity.
@@ -46,6 +52,10 @@ pub struct Relay {
     /// go straight over loopback instead of waiting for discovery to find
     /// their own machine.
     pub addr: EndpointAddr,
+    /// Every accepted [`MEDIA_ALPN`] connection, in arrival order. The
+    /// caller is expected to feed these to `corcel-net`'s host relay;
+    /// if the receiver is dropped they're just closed on arrival.
+    pub media: mpsc::UnboundedReceiver<iroh::endpoint::Connection>,
 }
 
 /// The relay's identity: an iroh secret key, kept as raw bytes so it
@@ -81,62 +91,8 @@ impl RelayIdentity {
     }
 }
 
-#[derive(Default)]
-struct ChannelState {
-    host: Option<(PeerId, mpsc::UnboundedSender<ServerMessage>)>,
-    participants: HashMap<PeerId, mpsc::UnboundedSender<ServerMessage>>,
-    watchers: HashMap<PeerId, mpsc::UnboundedSender<ServerMessage>>,
-}
-
-impl ChannelState {
-    fn sender_for(&self, peer: PeerId) -> Option<mpsc::UnboundedSender<ServerMessage>> {
-        if let Some((host_id, tx)) = &self.host {
-            if *host_id == peer {
-                return Some(tx.clone());
-            }
-        }
-        self.participants.get(&peer).cloned()
-    }
-
-    fn broadcast_except(&self, except: PeerId, msg: &ServerMessage) {
-        if let Some((host_id, tx)) = &self.host {
-            if *host_id != except {
-                let _ = tx.send(msg.clone());
-            }
-        }
-        for (id, tx) in &self.participants {
-            if *id != except {
-                let _ = tx.send(msg.clone());
-            }
-        }
-    }
-
-    fn occupant_count(&self) -> usize {
-        self.host.is_some() as usize + self.participants.len()
-    }
-
-    fn notify_watchers(&self) {
-        let count = self.occupant_count();
-        for tx in self.watchers.values() {
-            let _ = tx.send(ServerMessage::Presence { count });
-        }
-    }
-}
-
-enum Role {
-    Host,
-    Participant,
-    Watcher,
-    /// A room member (see [`ClientMessage::Room`]) — lives in `Rooms`, not
-    /// `Channels`, and speaks `Publish`/`Direct` instead of `Relay`.
-    Member,
-}
-
-type Channels = Arc<Mutex<HashMap<ChannelId, ChannelState>>>;
-
-/// Room membership: no host slot, no watchers — just who's here. Keyed by
-/// the same `ChannelId` type as channels but in a separate namespace (the
-/// app uses the *server's* id as its room key).
+/// Room membership: who's here, and how to reach them. Keyed by the room's
+/// id (the app uses the *server's* id as its room key).
 type Rooms = Arc<Mutex<HashMap<ChannelId, HashMap<PeerId, mpsc::UnboundedSender<ServerMessage>>>>>;
 
 /// Binds an iroh endpoint on the given persisted identity and starts
@@ -147,20 +103,20 @@ type Rooms = Arc<Mutex<HashMap<ChannelId, HashMap<PeerId, mpsc::UnboundedSender<
 pub async fn spawn(identity: &RelayIdentity) -> anyhow::Result<Relay> {
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::from_bytes(&identity.secret))
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), MEDIA_ALPN.to_vec()])
         .bind()
         .await?;
     let endpoint_id = endpoint.id();
     let addr = endpoint.addr();
     crate::client::register_local_relay(addr.clone());
 
-    let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
+    let (media_tx, media_rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let channels = channels.clone();
             let rooms = rooms.clone();
+            let media_tx = media_tx.clone();
             tokio::spawn(async move {
                 let result = async {
                     let conn = incoming.accept()?.await?;
@@ -168,37 +124,37 @@ pub async fn spawn(identity: &RelayIdentity) -> anyhow::Result<Relay> {
                 }
                 .await;
                 match result {
+                    Ok(conn) if conn.alpn() == MEDIA_ALPN => {
+                        // Media connections are corcel-net's to drive; an
+                        // unconsumed one just drops (and thereby closes).
+                        let _ = media_tx.send(conn);
+                    }
                     Ok(conn) => {
-                        if let Err(err) = handle_connection(conn, channels, rooms).await {
-                            tracing_stub_log(&err);
+                        if let Err(err) = handle_connection(conn, rooms).await {
+                            log_connection_error(&err);
                         }
                     }
                     // Handshake failures are background noise on an open
                     // QUIC socket (stray datagrams, wrong ALPN) — log and
                     // move on, same as the doc on `Incoming::accept` says.
-                    Err(err) => tracing_stub_log(&err),
+                    Err(err) => log_connection_error(&err),
                 }
             });
         }
     });
 
-    Ok(Relay { endpoint_id, addr })
+    Ok(Relay { endpoint_id, addr, media: media_rx })
 }
 
 // Small placeholder so we're not silently swallowing connection errors
 // before a real logging story exists.
-fn tracing_stub_log(err: &anyhow::Error) {
+fn log_connection_error(err: &anyhow::Error) {
     eprintln!("corcel-signal: connection error: {err:#}");
 }
 
-async fn handle_connection(
-    conn: iroh::endpoint::Connection,
-    channels: Channels,
-    rooms: Rooms,
-) -> anyhow::Result<()> {
+async fn handle_connection(conn: iroh::endpoint::Connection, rooms: Rooms) -> anyhow::Result<()> {
     // One bi-directional stream per connection, newline-delimited JSON both
-    // ways — the exact message types the WebSocket transport carried, minus
-    // the WebSocket.
+    // ways.
     let (mut writer, reader) = conn.accept_bi().await?;
     let mut lines = BufReader::new(reader).lines();
 
@@ -206,23 +162,20 @@ async fn handle_connection(
         Ok(Some(line)) => line,
         _ => return Ok(()), // client vanished before saying hello
     };
-    let (channel_id, peer_id, role) = match serde_json::from_str::<ClientMessage>(&first)? {
-        ClientMessage::Host { channel } => (channel, Uuid::new_v4(), Role::Host),
-        ClientMessage::Join { channel } => (channel, Uuid::new_v4(), Role::Participant),
-        ClientMessage::Watch { channel } => (channel, Uuid::new_v4(), Role::Watcher),
-        ClientMessage::Room { channel } => (channel, Uuid::new_v4(), Role::Member),
-        ClientMessage::Relay { .. } | ClientMessage::Publish { .. } | ClientMessage::Direct { .. } => {
+    let channel_id = match serde_json::from_str::<ClientMessage>(&first)? {
+        ClientMessage::Room { channel } => channel,
+        ClientMessage::Publish { .. } | ClientMessage::Direct { .. } => {
             let _ = send(&mut writer, &ServerMessage::Error {
-                message: "expected Host, Join, Watch, or Room as the first message".into(),
+                message: "expected Room as the first message".into(),
             })
             .await;
             return Ok(());
         }
     };
+    let peer_id: PeerId = Uuid::new_v4();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
-
-    if matches!(role, Role::Member) {
+    {
         let mut rooms = rooms.lock().unwrap();
         let room = rooms.entry(channel_id).or_default();
         let peers: Vec<PeerId> = room.keys().copied().collect();
@@ -231,46 +184,6 @@ async fn handle_connection(
         }
         room.insert(peer_id, tx.clone());
         let _ = tx.send(ServerMessage::RoomWelcome { your_peer: peer_id, peers });
-    } else {
-        let mut channels = channels.lock().unwrap();
-        let state = channels.entry(channel_id).or_default();
-        match role {
-            Role::Host => {
-                if state.host.is_some() {
-                    let _ = tx.send(ServerMessage::Error {
-                        message: "channel already has a host".into(),
-                    });
-                } else {
-                    state.host = Some((peer_id, tx.clone()));
-                    state.notify_watchers();
-                }
-            }
-            Role::Participant => {
-                if state.host.is_none() {
-                    let _ = tx.send(ServerMessage::Error {
-                        message: "channel has no host yet".into(),
-                    });
-                } else {
-                    state.participants.insert(peer_id, tx.clone());
-                    state.broadcast_except(peer_id, &ServerMessage::PeerJoined { peer: peer_id });
-                    state.notify_watchers();
-                }
-            }
-            Role::Watcher => {
-                state.watchers.insert(peer_id, tx.clone());
-            }
-            Role::Member => unreachable!("members are registered in `rooms` above"),
-        }
-        let host_id = state.host.as_ref().map(|(id, _)| *id);
-        let _ = tx.send(ServerMessage::Welcome {
-            your_peer: peer_id,
-            host: host_id,
-        });
-        if matches!(role, Role::Watcher) {
-            let _ = tx.send(ServerMessage::Presence {
-                count: state.occupant_count(),
-            });
-        }
     }
 
     // Forward the per-connection outbound queue to the actual stream.
@@ -284,14 +197,8 @@ async fn handle_connection(
 
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(msg) = serde_json::from_str::<ClientMessage>(&line) else { continue };
-        match (&role, msg) {
-            (Role::Host | Role::Participant, ClientMessage::Relay { to, payload }) => {
-                let target = channels.lock().unwrap().get(&channel_id).and_then(|s| s.sender_for(to));
-                if let Some(target) = target {
-                    let _ = target.send(ServerMessage::Relay { from: peer_id, payload });
-                }
-            }
-            (Role::Member, ClientMessage::Publish { payload }) => {
+        match msg {
+            ClientMessage::Publish { payload } => {
                 let targets: Vec<_> = rooms
                     .lock()
                     .unwrap()
@@ -307,24 +214,19 @@ async fn handle_connection(
                     });
                 }
             }
-            (Role::Member, ClientMessage::Direct { to, payload }) => {
+            ClientMessage::Direct { to, payload } => {
                 let target = rooms.lock().unwrap().get(&channel_id).and_then(|room| room.get(&to).cloned());
                 if let Some(target) = target {
                     let _ = target.send(ServerMessage::Direct { from: peer_id, payload });
                 }
             }
-            _ => {} // a message this connection's role doesn't get to send
+            ClientMessage::Room { .. } => {} // already in a room; ignored
         }
     }
 
     // Connection closed: tear down this peer's membership and let the rest
-    // of the channel/room know. For channels this is derived from actual
-    // membership (not the `is_host` this connection *asked* for above) — a
-    // connection whose Host claim was rejected because the channel already
-    // had one never became host or a participant, and clearing `state.host`
-    // based on its stale intent would evict the real host from under it,
-    // breaking the channel for everyone.
-    if matches!(role, Role::Member) {
+    // of the room know.
+    {
         let mut rooms = rooms.lock().unwrap();
         if let Some(room) = rooms.get_mut(&channel_id) {
             if room.remove(&peer_id).is_some() {
@@ -334,27 +236,6 @@ async fn handle_connection(
             }
             if room.is_empty() {
                 rooms.remove(&channel_id);
-            }
-        }
-    } else {
-        let mut channels = channels.lock().unwrap();
-        if let Some(state) = channels.get_mut(&channel_id) {
-            let was_host = state.host.as_ref().is_some_and(|(id, _)| *id == peer_id);
-            let was_participant = if was_host {
-                false
-            } else {
-                state.participants.remove(&peer_id).is_some()
-            };
-            if was_host {
-                state.host = None;
-            }
-            state.watchers.remove(&peer_id);
-            if was_host || was_participant {
-                state.broadcast_except(peer_id, &ServerMessage::PeerLeft { peer: peer_id });
-                state.notify_watchers();
-            }
-            if state.host.is_none() && state.participants.is_empty() && state.watchers.is_empty() {
-                channels.remove(&channel_id);
             }
         }
     }
