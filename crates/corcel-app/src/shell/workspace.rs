@@ -883,7 +883,16 @@ impl Shell {
             }
         };
 
-        div().flex_1().min_w_0().h_full().relative().flex().flex_col().child(content).children(error_toast)
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(theme::aurora())
+            .child(content)
+            .children(error_toast)
     }
 
     /// The composed layout once any server exists: server rail, then — for
@@ -898,7 +907,7 @@ impl Shell {
             .size_full()
             .flex()
             .overflow_hidden()
-            .bg(theme::background())
+
             .text_color(theme::foreground())
             .child(rail);
 

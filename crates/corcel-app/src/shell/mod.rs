@@ -812,11 +812,12 @@ impl Render for Shell {
             .relative()
             .flex()
             .flex_col()
-            // Theme ground truth for the whole tree: every screen and —
-            // crucially — every `deferred` overlay inherits these, so a
-            // modal can never fall back to the window default (black text)
-            // just because its own subtree forgot to set a color.
-            .bg(theme::aurora())
+            // Text color is set once here so every screen and `deferred`
+            // overlay inherits it. Deliberately NO root background: the
+            // window is system-blurred, and per the Liquid Glass layer
+            // model the chrome columns (titlebar, rail, sidebar) paint
+            // translucent — desktop vibrancy shows through them — while
+            // content panes paint their own opaque ground.
             .text_color(theme::foreground())
             .on_key_down(cx.listener(Self::root_key_down))
             .on_key_up(cx.listener(Self::root_key_up))

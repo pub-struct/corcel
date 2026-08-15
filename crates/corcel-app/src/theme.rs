@@ -41,10 +41,12 @@ pub fn popover() -> Rgba {
     rgba(0x202128ee)
 }
 
-/// Main content background (video panel, empty states) — the lightest of
-/// the three surfaces, matching Discord's chat pane.
+/// Main content background (chat, video panel, empty states). Opaque on
+/// purpose: per Apple's Liquid Glass layer model, glass belongs to the
+/// chrome floating *above* content — content itself stays a solid, calm
+/// ground the glass can refract.
 pub fn background() -> Rgba {
-    rgba(0x15161bdd)
+    rgb(0x15161b)
 }
 
 /// Hover / active row background within a sidebar or list.
@@ -179,8 +181,8 @@ pub fn primary_gradient() -> gpui::Background {
 pub fn aurora() -> gpui::Background {
     gpui::linear_gradient(
         150.,
-        gpui::linear_color_stop(gpui::rgba(0x24262edd), 0.),
-        gpui::linear_color_stop(gpui::rgba(0x101115dd), 1.),
+        gpui::linear_color_stop(gpui::rgba(0x24262eff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x101115ff), 1.),
     )
 }
 
