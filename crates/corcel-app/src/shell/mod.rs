@@ -351,6 +351,12 @@ pub(crate) struct Shell {
     /// [`profile::save_peer_avatar`]). Seeded from disk at startup,
     /// updated whenever a `ChatPayload::Profile` arrives.
     peer_avatars: HashMap<String, PathBuf>,
+    /// Replicated peer bios, by author name. Memory-only — cheap to
+    /// re-receive with the next `ChatPayload::Profile`, unlike avatars.
+    peer_bios: HashMap<String, String>,
+    /// Whether the edit-profile modal (the onboarding identity card,
+    /// reopened) is up.
+    edit_profile_open: bool,
     /// This user's avatar as it goes on the wire (base64 PNG), computed
     /// lazily on the first room join and reused after — the outer `None`
     /// means "not encoded yet", the inner one "user has no avatar".
@@ -425,6 +431,8 @@ impl Shell {
             speaking: HashMap::new(),
             voice_occupants: HashMap::new(),
             peer_avatars: profile::load_peer_avatars(),
+            peer_bios: HashMap::new(),
+            edit_profile_open: false,
             encoded_avatar: None,
             replying_to: None,
             editing: None,
@@ -623,10 +631,14 @@ impl Shell {
                     return;
                 }
             }
-            // Escape unwinds in-flight message state, most-specific first:
-            // an open edit, then the emoji palette, then the reply setup.
+            // Escape unwinds in-flight state, most-specific first: the
+            // edit-profile modal, an open message edit, then the emoji
+            // palette, then the reply setup.
             if key == "escape" {
-                if self.editing.is_some() {
+                if self.edit_profile_open {
+                    self.edit_profile_open = false;
+                    cx.notify();
+                } else if self.editing.is_some() {
                     self.cancel_edit(cx);
                 } else if self.reacting_to.take().is_some() || self.replying_to.take().is_some() {
                     cx.notify();
@@ -710,6 +722,8 @@ impl Render for Shell {
 
         let modal = (self.profile.is_some() && self.add_server_open)
             .then(|| deferred(self.render_add_server_modal(cx)).with_priority(1));
+        let edit_profile = (self.profile.is_some() && self.edit_profile_open)
+            .then(|| deferred(self.render_edit_profile_modal(cx)).with_priority(1));
         let switcher = (self.profile.is_some() && self.switcher_open)
             .then(|| deferred(self.render_quick_switcher(cx)).with_priority(2));
 
@@ -724,6 +738,7 @@ impl Render for Shell {
             .on_key_up(cx.listener(Self::root_key_up))
             .child(content)
             .children(modal)
+            .children(edit_profile)
             .children(switcher)
     }
 }

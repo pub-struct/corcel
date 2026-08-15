@@ -41,12 +41,14 @@ impl Shell {
         self.submit_profile(cx);
     }
 
-    pub(super) fn submit_profile(&mut self, cx: &mut Context<Self>) {
+    /// Validates and persists the form as the profile. `true` on success —
+    /// the edit-profile flow needs to know whether to close and broadcast.
+    pub(super) fn submit_profile(&mut self, cx: &mut Context<Self>) -> bool {
         let name = self.profile_form.name_input.read(cx).content.trim().to_string();
         if name.is_empty() {
             self.profile_form.error = Some("A name is required.".to_string());
             cx.notify();
-            return;
+            return false;
         }
         let bio = self.profile_form.bio_input.read(cx).content.trim().to_string();
         let profile = Profile {
@@ -58,11 +60,109 @@ impl Shell {
         if let Err(err) = profile.save() {
             self.profile_form.error = Some(format!("couldn't save profile: {err:#}"));
             cx.notify();
-            return;
+            return false;
         }
         self.profile_form.error = None;
         self.profile = Some(profile);
         cx.notify();
+        true
+    }
+
+    /// Reopens the identity card (seeded from the saved profile) as a
+    /// modal — the post-onboarding way to change name, photo, banner, or
+    /// bio. Reached from the sidebar footer's avatar.
+    pub(super) fn open_edit_profile_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile.clone() else { return };
+        self.profile_form
+            .name_input
+            .update(cx, |input, cx| input.set_content(profile.name.clone(), cx));
+        self.profile_form
+            .bio_input
+            .update(cx, |input, cx| input.set_content(profile.bio.clone().unwrap_or_default(), cx));
+        self.profile_form.avatar_path = profile.avatar_path;
+        self.profile_form.banner_path = profile.banner_path;
+        self.profile_form.error = None;
+        self.edit_profile_open = true;
+        cx.notify();
+    }
+
+    pub(super) fn close_edit_profile_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_profile_open = false;
+        cx.notify();
+    }
+
+    /// Saves the edited profile and immediately re-announces the card to
+    /// every connected room, so friends see the new photo/bio without
+    /// waiting for the next reconnect.
+    pub(super) fn save_edited_profile_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.submit_profile(cx) {
+            return;
+        }
+        self.broadcast_profile();
+        self.edit_profile_open = false;
+        cx.notify();
+    }
+
+    /// The edit-profile modal: the same card the onboarding identity
+    /// screen edits, wrapped in the app's standard modal chrome.
+    pub(super) fn render_edit_profile_modal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let backdrop = div().size_full().absolute().top_0().left_0().bg(theme::scrim());
+        let error = self.profile_form.error.clone().map(|message| {
+            div().text_size(px(12.)).text_color(theme::destructive_foreground()).child(message)
+        });
+
+        let card = div()
+            .id("edit-profile-card")
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .p(px(24.))
+            .bg(theme::popover())
+            .border_1()
+            .border_color(theme::border())
+            .rounded_xl()
+            .shadow_lg()
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::close_edit_profile_clicked))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(24.))
+                    .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child("Your profile"))
+                    .child(
+                        theme::icon_button("close-edit-profile", icons::X, "Close")
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_edit_profile_clicked)),
+                    ),
+            )
+            .child(self.render_profile_card(cx))
+            .children(error)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        theme::button(ButtonVariant::Ghost, "Cancel")
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::close_edit_profile_clicked)),
+                    )
+                    .child(
+                        theme::button(ButtonVariant::Primary, "Save")
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::save_edited_profile_clicked)),
+                    ),
+            );
+
+        div()
+            .size_full()
+            .absolute()
+            .top_0()
+            .left_0()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .items_center()
+            .child(backdrop)
+            .child(card)
     }
 
     pub(super) fn open_add_server_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -250,6 +350,74 @@ impl Shell {
                 },
             )));
 
+        let card = self.render_profile_card(cx);
+
+        let error = self.profile_form.error.clone().map(|message| {
+            div().text_size(px(12.5)).text_color(theme::destructive_foreground()).child(message)
+        });
+
+        let form = div()
+            .flex()
+            .flex_col()
+            .gap(px(22.))
+            .w(px(340.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(div().text_size(px(28.)).font_weight(FontWeight::BOLD).child("First — you."))
+                    .child(
+                        div()
+                            .text_size(px(13.5))
+                            .text_color(theme::muted_foreground())
+                            .child("This card is how friends see you. Only the name is required."),
+                    ),
+            )
+            .child(card)
+            .children(error)
+            .child(
+                theme::button(ButtonVariant::Primary, "That's me →")
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::profile_continue_clicked)),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .bg(theme::background())
+            .text_color(theme::foreground())
+            .child(brand)
+            .child(
+                div().flex_1().h_full().flex().items_center().justify_center().p(px(24.)).child(
+                    form.with_animation(
+                        "identity-form",
+                        Animation::new(Duration::from_millis(380)).with_easing(ease_out_quint()),
+                        |form, delta| form.opacity(delta),
+                    ),
+                ),
+            )
+    }
+
+    /// The editable profile card — banner picker on top, avatar picker
+    /// overlapping it, then the name/bio inputs. Shared between first-run
+    /// onboarding ([`Self::render_profile_setup`]) and the edit-profile
+    /// modal ([`Self::render_edit_profile_modal`]); both read and write
+    /// [`Shell::profile_form`].
+    pub(super) fn render_profile_card(&mut self, cx: &mut Context<Self>) -> Div {
+        let initial = self
+            .profile_form
+            .name_input
+            .read(cx)
+            .content
+            .trim()
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string());
+
         let banner: AnyElement = match &self.profile_form.banner_path {
             Some(path) => {
                 img(ImageSource::from(path.clone())).size_full().object_fit(ObjectFit::Cover).into_any_element()
@@ -339,56 +507,26 @@ impl Shell {
                     .flex_col()
                     .gap(px(12.))
                     .child(self.profile_form.name_input.clone())
-                    .child(self.profile_form.bio_input.clone()),
-            );
-
-        let error = self.profile_form.error.clone().map(|message| {
-            div().text_size(px(12.5)).text_color(theme::destructive_foreground()).child(message)
-        });
-
-        let form = div()
-            .flex()
-            .flex_col()
-            .gap(px(22.))
-            .w(px(340.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(div().text_size(px(28.)).font_weight(FontWeight::BOLD).child("First — you."))
-                    .child(
+                    .child(self.profile_form.bio_input.clone())
+                    .children(self.profile_form.avatar_path.is_some().then(|| {
                         div()
-                            .text_size(px(13.5))
+                            .id("remove-avatar")
+                            .text_size(px(12.))
                             .text_color(theme::muted_foreground())
-                            .child("This card is how friends see you. Only the name is required."),
-                    ),
-            )
-            .child(card)
-            .children(error)
-            .child(
-                theme::button(ButtonVariant::Primary, "That's me →")
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::profile_continue_clicked)),
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(theme::destructive_foreground()))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|shell, _, _window, cx| {
+                                    shell.profile_form.avatar_path = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("Remove photo")
+                    })),
             );
 
-        div()
-            .size_full()
-            .flex()
-            .bg(theme::background())
-            .text_color(theme::foreground())
-            .child(brand)
-            .child(
-                div().flex_1().h_full().flex().items_center().justify_center().p(px(24.)).child(
-                    form.with_animation(
-                        "identity-form",
-                        Animation::new(Duration::from_millis(380)).with_easing(ease_out_quint()),
-                        |form, delta| form.opacity(delta),
-                    ),
-                ),
-            )
+        card
     }
 
     /// The body of the current [`AddServerStage`] — shared verbatim between

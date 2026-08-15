@@ -711,8 +711,13 @@ impl Shell {
             .gap(px(8.))
             .child(
                 div()
+                    .id("footer-edit-profile")
                     .relative()
                     .flex_none()
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    .tooltip(theme::tooltip("Edit profile"))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::open_edit_profile_clicked))
                     .child(theme::avatar(profile.avatar_path.clone(), profile.initial(), px(32.)))
                     .child(
                         div()

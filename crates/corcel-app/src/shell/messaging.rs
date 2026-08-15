@@ -325,7 +325,7 @@ impl Shell {
                 Ok(ChatPayload::VoicePresence { channel, author, present }) => {
                     self.note_voice_presence(channel, from, author, present, cx);
                 }
-                Ok(ChatPayload::Profile { author, avatar }) => self.absorb_profile(author, avatar, cx),
+                Ok(ChatPayload::Profile { author, avatar, bio }) => self.absorb_profile(author, avatar, bio, cx),
                 _ => {}
             },
             ServerMessage::Direct { from, payload } => match serde_json::from_value(payload) {
@@ -350,7 +350,7 @@ impl Shell {
                 }
                 // The direct copy of a member's profile card, sent to us
                 // when we entered a room they were already in.
-                Ok(ChatPayload::Profile { author, avatar }) => self.absorb_profile(author, avatar, cx),
+                Ok(ChatPayload::Profile { author, avatar, bio }) => self.absorb_profile(author, avatar, bio, cx),
                 // Everything else (Typing, Edit, …) is broadcast-only; a
                 // direct one is a peer bug, and unparseable JSON is a newer
                 // build's payload — both dropped.
@@ -387,23 +387,53 @@ impl Shell {
         ChatPayload::Profile {
             author: self.my_name(),
             avatar: self.encoded_avatar.clone().flatten(),
+            bio: self.profile.as_ref().and_then(|profile| profile.bio.clone()),
         }
     }
 
-    /// Caches a peer's replicated avatar on disk and points the UI at it.
-    /// Our own name is ignored (we already have the original file), and so
-    /// is a photo-less card — see [`ChatPayload::Profile`] on why absence
-    /// doesn't un-set anything.
-    pub(super) fn absorb_profile(&mut self, author: String, avatar: Option<String>, cx: &mut Context<Self>) {
+    /// Re-announces this user's card to every connected room — called
+    /// after a profile edit so the new photo/bio propagates immediately
+    /// instead of waiting for the next room (re)join.
+    pub(super) fn broadcast_profile(&mut self) {
+        self.encoded_avatar = None; // re-encode: the avatar may have changed
+        let payload = self.my_profile_payload();
+        let server_ids: Vec<Uuid> = self.rooms.keys().copied().collect();
+        for server_id in server_ids {
+            self.send_room(server_id, payload.clone(), None);
+        }
+    }
+
+    /// Caches a peer's replicated card: avatar to disk (see
+    /// [`profile::save_peer_avatar`]) and bio in memory. Our own name is
+    /// ignored (we already have the originals). A card with no avatar
+    /// drops any cached one — that's how photo removal propagates.
+    pub(super) fn absorb_profile(
+        &mut self,
+        author: String,
+        avatar: Option<String>,
+        bio: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if author == self.my_name() {
             return;
         }
-        let Some(avatar) = avatar else { return };
-        let Some(path) = profile::save_peer_avatar(&author, &avatar) else { return };
-        if self.peer_avatars.get(&author) != Some(&path) {
-            self.peer_avatars.insert(author, path);
-            cx.notify();
+        match bio {
+            Some(bio) => drop(self.peer_bios.insert(author.clone(), bio)),
+            None => drop(self.peer_bios.remove(&author)),
         }
+        match avatar {
+            Some(avatar) => {
+                let Some(path) = profile::save_peer_avatar(&author, &avatar) else { return };
+                if self.peer_avatars.get(&author) != Some(&path) {
+                    self.peer_avatars.insert(author, path);
+                }
+            }
+            None => {
+                profile::remove_peer_avatar(&author);
+                self.peer_avatars.remove(&author);
+            }
+        }
+        cx.notify();
     }
 
     pub(super) fn send_room(&self, server_id: Uuid, payload: ChatPayload, to: Option<PeerId>) {

@@ -165,6 +165,24 @@ pub fn save_peer_avatar(author: &str, avatar_base64: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Deletes every cached avatar file for an author — how a peer's "I
+/// removed my photo" propagates to this machine's disk cache.
+pub fn remove_peer_avatar(author: &str) {
+    let author_hex = hex_encode(author.as_bytes());
+    let Ok(entries) = std::fs::read_dir(avatars_dir()) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.split_once('-'))
+            .is_some_and(|(hex, _)| hex == author_hex)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Every peer avatar already on disk, keyed by author name — what seeds
 /// the shell's avatar map at startup, so replicated avatars survive a
 /// restart without waiting for the peers to come online again.
