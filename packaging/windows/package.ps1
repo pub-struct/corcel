@@ -34,25 +34,27 @@ if (-not (Test-Path "$GStreamerRoot\bin\gstreamer-1.0-0.dll")) {
 # encode, RTP, decode, playback — plus the hardware encoder/decoder sets
 # whose availability depends on the *user's* GPU, so all of them ship and
 # codec.rs picks at runtime exactly like it does against a system install.
+# Bare plugin names: the DLL is gst<name>.dll in the official MSVC
+# packages and libgst<name>.dll in MinGW-convention builds.
 $plugins = @(
-    'libgstcoreelements.dll',      # queue, capsfilter, ...
-    'libgstapp.dll',               # appsrc / appsink
-    'libgsttypefindfunctions.dll',
-    'libgstaudioconvert.dll',
-    'libgstaudioresample.dll',
-    'libgstlevel.dll',             # speaking detection
-    'libgstopus.dll',
-    'libgstrtp.dll',               # rtp{opus,h264}{pay,depay}
-    'libgstrtpmanager.dll',        # rtpjitterbuffer
-    'libgstvideoconvertscale.dll',
-    'libgstvideoparsersbad.dll',   # h264parse
-    'libgstwasapi2.dll',           # mic + speakers
-    'libgstmediafoundation.dll',   # camera + mfh264enc
-    'libgstd3d11.dll',             # screen capture, d3d11download, DXVA decode
-    'libgstd3d12.dll',
-    'libgstnvcodec.dll',
-    'libgstqsv.dll',
-    'libgstamfcodec.dll'
+    'coreelements',      # queue, capsfilter, ...
+    'app',               # appsrc / appsink
+    'typefindfunctions',
+    'audioconvert',
+    'audioresample',
+    'level',             # speaking detection
+    'opus',
+    'rtp',               # rtp{opus,h264}{pay,depay}
+    'rtpmanager',        # rtpjitterbuffer
+    'videoconvertscale',
+    'videoparsersbad',   # h264parse
+    'wasapi2',           # mic + speakers
+    'mediafoundation',   # camera + mfh264enc
+    'd3d11',             # screen capture, d3d11download, DXVA decode
+    'd3d12',
+    'nvcodec',
+    'qsv',
+    'amfcodec'
 )
 
 if (Test-Path $Out) { Remove-Item -Recurse -Force $Out }
@@ -63,8 +65,11 @@ Copy-Item "$GStreamerRoot\bin\*.dll" $Out
 
 $missing = @()
 foreach ($plugin in $plugins) {
-    $path = "$GStreamerRoot\lib\gstreamer-1.0\$plugin"
-    if (Test-Path $path) {
+    $path = @("gst$plugin.dll", "libgst$plugin.dll") |
+        ForEach-Object { Join-Path $GStreamerRoot "lib\gstreamer-1.0\$_" } |
+        Where-Object { Test-Path $_ } |
+        Select-Object -First 1
+    if ($path) {
         Copy-Item $path "$Out\lib\gstreamer-1.0"
     } else {
         $missing += $plugin
