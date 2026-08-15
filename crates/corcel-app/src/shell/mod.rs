@@ -11,6 +11,7 @@ mod embeds;
 mod messaging;
 mod onboarding;
 mod switcher;
+mod titlebar;
 mod workspace;
 
 use std::collections::HashMap;
@@ -784,9 +785,17 @@ impl Render for Shell {
         div()
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .on_key_down(cx.listener(Self::root_key_down))
             .on_key_up(cx.listener(Self::root_key_up))
-            .child(content)
+            // The custom titlebar sits above everything (the native one is
+            // hidden/transparent on every platform — see shell/titlebar.rs);
+            // the app fills the rest. Modals/overlays are absolute against
+            // this root, so they may cover the bar — that's fine, it has no
+            // state a modal could hide.
+            .child(self.render_titlebar(cx))
+            .child(div().flex_1().min_h_0().w_full().relative().child(content))
             .children(modal)
             .children(edit_profile)
             .children(switcher)

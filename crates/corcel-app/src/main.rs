@@ -13,7 +13,7 @@ mod store;
 mod text_input;
 mod theme;
 
-use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size};
 
 use shell::Shell;
 
@@ -57,7 +57,17 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions { title: Some("corcel".into()), ..Default::default() }),
+                    // The titlebar is corcel-drawn on every platform (see
+                    // shell/titlebar.rs). macOS keeps its native traffic
+                    // lights, floated over the custom bar's left edge and
+                    // vertically centered in its 36px height; Windows takes
+                    // this as "custom frame" and hit-tests the bar's
+                    // window-control areas natively.
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("corcel".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(12.0), px(11.0))),
+                    }),
                     // The app-shell's server-rail + channel-sidebar alone take
                     // ~312px of fixed-width chrome, so keep the window from
                     // shrinking small enough to crush the video panel. The
