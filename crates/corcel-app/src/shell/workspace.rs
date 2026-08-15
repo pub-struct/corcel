@@ -93,26 +93,24 @@ impl Shell {
                         (totals.0 + unread, totals.1 + mentions)
                     });
 
+                // Vertically centered by flex, not offsets — immune to
+                // bubble-size changes.
+                let pill_bar = |height: f32| {
+                    div().w(px(4.)).h(px(height)).rounded_r_full().bg(theme::foreground())
+                };
                 let pill = if is_active {
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px(4.))
-                        .w(px(4.))
-                        .h(px(36.))
-                        .rounded_r_full()
-                        .bg(theme::foreground())
+                    div().absolute().left_0().top_0().bottom_0().flex().items_center().child(pill_bar(36.))
                 } else {
                     div()
                         .absolute()
                         .left_0()
-                        .top(px(12.))
-                        .w(px(4.))
-                        .h(px(20.))
-                        .rounded_r_full()
-                        .bg(theme::foreground())
+                        .top_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
                         .invisible()
                         .group_hover(group_name.clone(), |style| style.visible())
+                        .child(pill_bar(20.))
                 };
 
                 div()
@@ -221,13 +219,13 @@ impl Shell {
                 div()
                     .absolute()
                     .left_0()
-                    .top(px(12.))
-                    .w(px(4.))
-                    .h(px(20.))
-                    .rounded_r_full()
-                    .bg(theme::foreground())
+                    .top_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
                     .invisible()
-                    .group_hover("rail-add", |style| style.visible()),
+                    .group_hover("rail-add", |style| style.visible())
+                    .child(div().w(px(4.)).h(px(20.)).rounded_r_full().bg(theme::foreground())),
             )
             .child(
                 div()
