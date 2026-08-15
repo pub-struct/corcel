@@ -1,0 +1,50 @@
+# Compile guard for the Windows port (PLAN-windows.md step 6): keeps the
+# workspace building against MSVC + GStreamer so the port can't rot between
+# the machines it's actually run on. Compile-only on purpose — the runners
+# have no GPU, no audio devices, and no display, so anything past `cargo
+# check` would be testing the runner, not corcel.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-windows:
+    name: check (windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The official GStreamer MSVC packages, via their chocolatey wrappers:
+      # `gstreamer` is the runtime, `gstreamer-devel` the headers/.pc files.
+      # Both land in C:\gstreamer\1.0\msvc_x86_64. pkgconfiglite provides the
+      # pkg-config.exe that the gstreamer-sys build scripts resolve .pc files
+      # with (the dev package ships the .pc files but not the tool).
+      - name: Install GStreamer (MSVC) + pkg-config
+        run: choco install -y --no-progress gstreamer gstreamer-devel pkgconfiglite
+
+      - name: Expose GStreamer to cargo
+        shell: pwsh
+        run: |
+          $root = 'C:\gstreamer\1.0\msvc_x86_64'
+          if (-not (Test-Path "$root\lib\pkgconfig")) {
+            Write-Error "GStreamer dev package not found at $root"
+          }
+          Add-Content $env:GITHUB_ENV "PKG_CONFIG_PATH=$root\lib\pkgconfig"
+          Add-Content $env:GITHUB_PATH "$root\bin"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --all-targets so the test/bench targets (e.g. corcel-signal's
+      # handshake test) must compile too, not just the libraries.
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
