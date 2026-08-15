@@ -105,14 +105,18 @@ pub struct AudioPlayback {
 }
 
 impl AudioPlayback {
-    /// Decodes straight to the default PipeWire audio sink — there's no
-    /// caller-facing output here, unlike [`VideoPlayback`], since audio has
-    /// nowhere else useful to go.
+    /// Decodes straight to the system-default audio sink (PipeWire on
+    /// Linux, CoreAudio on macOS) — there's no caller-facing output here,
+    /// unlike [`VideoPlayback`], since audio has nowhere else useful to go.
     pub fn new() -> anyhow::Result<Self> {
+        #[cfg(target_os = "macos")]
+        const AUDIO_SINK: &str = "osxaudiosink";
+        #[cfg(not(target_os = "macos"))]
+        const AUDIO_SINK: &str = "pipewiresink";
         let description = format!(
             "appsrc name=src is-live=true format=time do-timestamp=true \
              caps=\"application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload={pt}\" \
-             ! rtpjitterbuffer ! rtpopusdepay ! opusdec ! audioconvert ! audioresample ! pipewiresink",
+             ! rtpjitterbuffer ! rtpopusdepay ! opusdec ! audioconvert ! audioresample ! {AUDIO_SINK}",
             pt = corcel_net::OPUS_PAYLOAD_TYPE,
         );
         let gst_pipeline = pipeline::build(&description)?;

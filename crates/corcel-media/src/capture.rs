@@ -7,6 +7,7 @@
 
 use std::any::Any;
 use std::future::Future;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 
@@ -123,10 +124,19 @@ fn pump_packets(label: &'static str, sink: AppSink) -> mpsc::Receiver<rtc::rtp::
     rx
 }
 
-/// Captures from a V4L2 camera device (e.g. `/dev/video0`).
+/// Captures from a camera: a V4L2 device (e.g. `/dev/video0`) on Linux, or
+/// the system default camera via AVFoundation on macOS (where `device` is
+/// ignored — the concept of a device *path* doesn't exist there).
 pub fn camera(device: &str) -> anyhow::Result<Capture> {
+    #[cfg(target_os = "macos")]
+    let source = {
+        let _ = device;
+        "avfvideosrc".to_string()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let source = format!("v4l2src device=\"{device}\"");
     let description = format!(
-        "v4l2src device=\"{device}\" ! {postproc} \
+        "{source} ! {postproc} \
          ! video/x-raw,width=1280,height=720,framerate=30/1 ! {encoder} \
          ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
          ! appsink name=sink emit-signals=false sync=false",
@@ -152,8 +162,14 @@ const SPEAKING_HANGOVER: std::time::Duration = std::time::Duration::from_millis(
 /// encoder by GStreamer's `level` element — so it keeps reporting while
 /// the app-level mute merely discards the encoded packets downstream.
 pub fn microphone() -> anyhow::Result<(Capture, watch::Receiver<bool>)> {
+    // CoreAudio's source element on macOS, PipeWire elsewhere — both grab
+    // the system-default input device.
+    #[cfg(target_os = "macos")]
+    const AUDIO_SOURCE: &str = "osxaudiosrc";
+    #[cfg(not(target_os = "macos"))]
+    const AUDIO_SOURCE: &str = "pipewiresrc";
     let description = format!(
-        "pipewiresrc ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
+        "{AUDIO_SOURCE} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
          ! level interval=100000000 ! opusenc ! rtpopuspay pt={pt} \
          ! appsink name=sink emit-signals=false sync=false",
         pt = corcel_net::OPUS_PAYLOAD_TYPE,
@@ -241,10 +257,30 @@ fn watch_microphone_bus(gst_pipeline: &gstreamer::Pipeline) -> watch::Receiver<b
     rx
 }
 
+/// Captures the main display via AVFoundation/ScreenCaptureKit — macOS has
+/// no source-picker portal, so this shares the whole primary screen. The
+/// first attempt triggers the OS "Screen Recording" permission prompt for
+/// whatever app launched corcel (e.g. Terminal); the share fails until
+/// that's granted and the app restarted.
+#[cfg(target_os = "macos")]
+pub async fn screen() -> anyhow::Result<Capture> {
+    let description = format!(
+        "avfvideosrc capture-screen=true capture-screen-cursor=true ! video/x-raw \
+         ! {postproc} ! video/x-raw ! {encoder} \
+         ! h264parse config-interval=-1 ! rtph264pay pt={pt} mtu=1200 config-interval=-1 \
+         ! appsink name=sink emit-signals=false sync=false",
+        postproc = codec::video_postproc()?,
+        encoder = codec::h264_encoder()?,
+        pt = corcel_net::H264_PAYLOAD_TYPE,
+    );
+    start("screen share", &description, Vec::new(), None)
+}
+
 /// Captures the screen via the `org.freedesktop.portal.ScreenCast` portal
 /// (PROJECT.md decision 2): prompts the user to pick a monitor or window,
 /// then feeds the resulting PipeWire stream through the same H264 encode
 /// pipeline as [`camera`].
+#[cfg(target_os = "linux")]
 pub async fn screen() -> anyhow::Result<Capture> {
     use ashpd::desktop::PersistMode;
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};

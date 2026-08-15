@@ -5,7 +5,8 @@
 use super::*;
 
 /// The V4L2 device [`Shell::toggle_camera_clicked`] captures from. No device
-/// picker yet — first-pass wiring just needs one working camera.
+/// picker yet — first-pass wiring just needs one working camera. On macOS
+/// `corcel_media::capture::camera` ignores this and uses the system default.
 const CAMERA_DEVICE: &str = "/dev/video0";
 
 impl Shell {

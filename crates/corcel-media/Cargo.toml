@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
-ashpd = { version = "0.13.13", features = ["screencast"] }
 bytes = "1.12.1"
 corcel-net = { version = "0.1.0", path = "../corcel-net" }
 gstreamer = "0.25.3"
@@ -14,3 +13,8 @@ gstreamer-app = "0.25.2"
 gstreamer-video = "0.25.3"
 rtc = "0.20.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+
+# The ScreenCast portal is a Linux (XDG desktop) concept; macOS screen
+# capture goes through avfvideosrc instead (see capture::screen).
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13.13", features = ["screencast"] }
