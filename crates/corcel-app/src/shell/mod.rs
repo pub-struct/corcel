@@ -7,6 +7,7 @@
 //! constructor, navigation, and the root render + app-wide key handling.
 
 mod call;
+mod context_menu;
 mod embeds;
 mod messaging;
 mod onboarding;
@@ -41,6 +42,7 @@ use crate::theme::{self, ButtonVariant};
 use crate::{richtext, runtime};
 
 use call::{speaking_avatar, stage_tile};
+use context_menu::{ContextAction, ContextMenu, ContextMenuItem};
 use embeds::{ImageEmbed, VideoEmbed};
 
 /// How long a remote peer's speaking ring survives without a fresh
@@ -444,6 +446,8 @@ pub(crate) struct Shell {
     thread_counts: HashMap<Uuid, (u32, i64)>,
     /// The thread panel's composer.
     thread_input: Entity<TextInput>,
+    /// The open right-click menu, if any (see [`context_menu`]).
+    context_menu: Option<ContextMenu>,
     /// Which row of the composer's @mention autocomplete is highlighted.
     /// Clamped against the current candidate list at use; the popup itself
     /// is derived state (an `@word` under the caret with matches).
@@ -520,6 +524,7 @@ impl Shell {
             thread_counts: HashMap::new(),
             thread_input: cx.new(|cx| TextInput::new("Reply in thread…", cx)),
             mention_selected: 0,
+            context_menu: None,
             reacting_to: None,
             chat_reactions: HashMap::new(),
             image_embeds: HashMap::new(),
@@ -719,7 +724,9 @@ impl Shell {
             // edit-profile modal, an open message edit, then the emoji
             // palette, then the reply setup.
             if key == "escape" {
-                if self.edit_profile_open {
+                if self.context_menu.is_some() {
+                    self.close_context_menu(cx);
+                } else if self.edit_profile_open {
                     self.edit_profile_open = false;
                     cx.notify();
                 } else if self.editing.is_some() {
@@ -812,6 +819,8 @@ impl Render for Shell {
             .then(|| deferred(self.render_edit_profile_modal(cx)).with_priority(1));
         let switcher = (self.profile.is_some() && self.switcher_open)
             .then(|| deferred(self.render_quick_switcher(cx)).with_priority(2));
+        let context_menu =
+            self.context_menu.is_some().then(|| deferred(self.render_context_menu(cx)).with_priority(3));
 
         // App-wide keys (F11, Ctrl+K, the open switcher's navigation) are
         // registered on the outermost element so it's always an ancestor of
@@ -841,5 +850,6 @@ impl Render for Shell {
             .children(modal)
             .children(edit_profile)
             .children(switcher)
+            .children(context_menu)
     }
 }

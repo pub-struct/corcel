@@ -351,6 +351,7 @@ impl Shell {
             .map(|channel| {
                 let is_viewing = viewing_channel_id == Some(channel.id);
                 let channel_for_click = channel.clone();
+                let channel_id_for_menu = channel.id;
                 let (unread_count, mention_count) = self.unread.get(&channel.id).copied().unwrap_or((0, 0));
                 let has_unread = unread_count > 0 && !is_viewing;
                 div()
@@ -416,6 +417,28 @@ impl Shell {
                         MouseButton::Left,
                         cx.listener(move |shell, _, _window, cx| {
                             shell.open_text_channel(channel_for_click.clone(), cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |shell, event, _window, cx| {
+                            shell.open_context_menu(
+                                event,
+                                vec![
+                                    ContextMenuItem::new(
+                                        "Mark as read",
+                                        icons::MESSAGE_SQUARE,
+                                        ContextAction::MarkChannelRead { channel: channel_id_for_menu },
+                                    ),
+                                    ContextMenuItem::new(
+                                        "Edit channel name",
+                                        icons::PENCIL,
+                                        ContextAction::EditChannelName { channel: channel_id_for_menu },
+                                    )
+                                    .soon(),
+                                ],
+                                cx,
+                            );
                         }),
                     )
             })
@@ -537,11 +560,37 @@ impl Shell {
                 // Everyone else in this channel (see remote_roster), ring
                 // lit while they're audibly talking.
                 let roster = remote_roster.get(&channel.id).cloned().unwrap_or_default();
-                let speaker_rows = roster.into_iter().map(|(name, speaking)| {
+                let speaker_rows = roster.into_iter().enumerate().map(|(row_ix, (name, speaking))| {
                     let initial: SharedString =
                         name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default().into();
                     let avatar = self.peer_avatars.get(&name).cloned();
+                    let name_for_menu = name.clone();
                     div()
+                        .id(SharedString::from(format!("vc-occupant-{row_ix}")))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |shell, event, _window, cx| {
+                                shell.open_context_menu(
+                                    event,
+                                    vec![
+                                        ContextMenuItem::new(
+                                            "Adjust volume",
+                                            icons::VOLUME,
+                                            ContextAction::AdjustUserVolume { author: name_for_menu.clone() },
+                                        )
+                                        .soon(),
+                                        ContextMenuItem::new(
+                                            "Kick from voice",
+                                            icons::LOG_OUT,
+                                            ContextAction::KickFromVoice { author: name_for_menu.clone() },
+                                        )
+                                        .soon()
+                                        .destructive(),
+                                    ],
+                                    cx,
+                                );
+                            }),
+                        )
                         .mx(px(8.))
                         .pl(px(26.))
                         .pr(px(8.))
