@@ -135,7 +135,7 @@ impl Shell {
                         .servers
                         .iter()
                         .find(|s| s.link.id == server_id)
-                        .map(|server| server.link.endpoint_id().ok())
+                        .map(|server| server.link.endpoint_addr().ok())
                 });
                 let relay = match target {
                     Ok(Some(Some(relay))) => relay,

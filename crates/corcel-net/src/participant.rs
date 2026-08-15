@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use corcel_signal::relay::MEDIA_ALPN;
-use corcel_signal::{ChannelId, EndpointId};
+use corcel_signal::{ChannelId, EndpointAddr};
 use iroh::endpoint::{Connection, SendDatagramError};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -62,7 +62,7 @@ pub struct Participant {
 /// and spawns the demux task that turns incoming datagrams into
 /// [`RemoteTrack`]s. The task ends (closing every track's channel with it)
 /// when the connection does.
-pub async fn join(relay: EndpointId, channel: ChannelId) -> anyhow::Result<Participant> {
+pub async fn join(relay: EndpointAddr, channel: ChannelId) -> anyhow::Result<Participant> {
     let conn = corcel_signal::client::dial(relay, MEDIA_ALPN).await?;
 
     let (mut writer, reader) = conn.open_bi().await?;

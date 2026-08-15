@@ -6,7 +6,7 @@
 //! thread.
 
 use corcel_net::{CallHandle, Participant, TrackKind};
-use corcel_signal::{ChannelId, ClientMessage, EndpointId, RelayIdentity};
+use corcel_signal::{ChannelId, ClientMessage, EndpointAddr, Reach, RelayIdentity};
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
@@ -17,22 +17,26 @@ use crate::invite::{ChannelInfo, ChannelKind, ServerLink};
 /// caller persists the returned identity so [`rehost`] can bring the same
 /// server (same endpoint id, so the *same invite links*) back after a
 /// restart.
-pub async fn host(name: String) -> anyhow::Result<(ServerLink, RelayIdentity)> {
+pub async fn host(name: String, reach: Reach) -> anyhow::Result<(ServerLink, RelayIdentity)> {
     let identity = RelayIdentity::generate()?;
     let channels = vec![
         ChannelInfo { id: Uuid::new_v4(), name: "general".to_string(), kind: ChannelKind::Text },
         ChannelInfo { id: Uuid::new_v4(), name: "General".to_string(), kind: ChannelKind::Voice },
     ];
-    let link = spawn_and_host(Uuid::new_v4(), name, channels, &identity).await?;
+    let link = spawn_and_host(Uuid::new_v4(), name, channels, &identity, reach).await?;
     Ok((link, identity))
 }
 
-/// Brings a persisted hosted server back up after an app restart. Because
-/// the relay's dialable identity is its key (not an address), the returned
-/// link is equivalent to the old one — links shared months ago keep
-/// working, from any network the host wanders to.
+/// Brings a persisted hosted server back up after an app restart. For a
+/// [`Reach::Global`] server the returned link is equivalent to the old one
+/// (the dialable identity is the key, not an address) — links shared
+/// months ago keep working from any network the host wanders to. For a
+/// [`Reach::LocalNetwork`] server the link's direct addresses are re-read
+/// from the machine's current interfaces, so the caller should persist the
+/// returned link — that's what keeps "Copy invite link" handing out
+/// reachable addresses.
 pub async fn rehost(link: ServerLink, identity: RelayIdentity) -> anyhow::Result<ServerLink> {
-    spawn_and_host(link.id, link.name, link.channels, &identity).await
+    spawn_and_host(link.id, link.name, link.channels, &identity, link.reach).await
 }
 
 /// Spawns the relay with `identity` and starts the host-side media
@@ -45,9 +49,24 @@ async fn spawn_and_host(
     name: String,
     channels: Vec<ChannelInfo>,
     identity: &RelayIdentity,
+    reach: Reach,
 ) -> anyhow::Result<ServerLink> {
-    let relay = corcel_signal::relay::spawn(identity).await?;
+    let relay = corcel_signal::relay::spawn(identity, reach).await?;
     let relay_id = relay.endpoint_id;
+
+    // A local-network link must carry routes, not just an identity — with
+    // no public discovery, the addresses in the link are the only way in.
+    // Loopback would only ever work for the host itself, so it's dropped;
+    // everything else (LAN and VPN interface addrs alike) goes in.
+    let addrs = match reach {
+        Reach::Global => Vec::new(),
+        Reach::LocalNetwork => relay
+            .addr
+            .ip_addrs()
+            .filter(|addr| !addr.ip().is_loopback() && !addr.ip().is_unspecified())
+            .copied()
+            .collect(),
+    };
 
     tokio::spawn(corcel_net::HostRelay::run(relay.media));
 
@@ -55,6 +74,8 @@ async fn spawn_and_host(
         id: server_id,
         name,
         node: Some(relay_id.to_string()),
+        reach,
+        addrs,
         channels,
     })
 }
@@ -65,7 +86,7 @@ async fn spawn_and_host(
 /// way — [`corcel_signal::client`] short-circuits same-process relays to
 /// loopback internally.
 pub async fn open_room(
-    relay: EndpointId,
+    relay: EndpointAddr,
     server_id: Uuid,
 ) -> anyhow::Result<corcel_signal::client::Connection> {
     corcel_signal::client::connect(relay, ClientMessage::Room { channel: server_id }).await
@@ -76,7 +97,7 @@ pub async fn open_room(
 /// also dials its own relay, same as everyone else). Once connected, starts
 /// streaming mic audio in and remote audio out — see [`attach_media`].
 pub async fn join(link: ServerLink, channel: ChannelId) -> anyhow::Result<CallSession> {
-    let participant = corcel_net::join(link.endpoint_id()?, channel).await?;
+    let participant = corcel_net::join(link.endpoint_addr()?, channel).await?;
     attach_media(participant).await
 }
 

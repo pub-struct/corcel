@@ -13,6 +13,6 @@ pub mod client;
 pub mod protocol;
 pub mod relay;
 
-pub use iroh::EndpointId;
+pub use iroh::{EndpointAddr, EndpointId, TransportAddr};
 pub use protocol::{ChannelId, ClientMessage, PeerId, ServerMessage};
-pub use relay::RelayIdentity;
+pub use relay::{Reach, RelayIdentity};

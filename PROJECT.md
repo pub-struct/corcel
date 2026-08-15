@@ -104,6 +104,22 @@ screen share, relayed through the host, running reliably on Linux/GNOME/Wayland.
    the server → channel-list → join-channel structure is built as part of
    this phase, not bolted on after.
 
+9. **Per-server reach — global (iroh) or private-network, chosen at
+   creation.** A server is either *global* (the default: its endpoint
+   publishes to iroh's public relay/DNS infrastructure, so invite links
+   work from any network, with hole-punching and relayed fallback) or
+   *local-network* (nothing is ever announced to public infrastructure;
+   only peers that can already route to the host — same LAN, or a shared
+   VPN such as Tailscale — can connect, which suits corporate/self-managed
+   deployments). Local links must carry the host's direct socket
+   addresses (there is no discovery to resolve the key alone), so they are
+   re-minted from the current interfaces on every launch and go stale if
+   the host's IP changes — the create-server UI states this tradeoff
+   plainly. A client can be a member of both kinds at once; the choice
+   only changes how the relay endpoint is built and what the link
+   carries — everything above the dial (rooms, chat, call media) is
+   identical.
+
 ## Explicitly Out of Scope (Phase 1)
 
 - Text chat / chat rooms

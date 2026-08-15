@@ -27,12 +27,32 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::protocol::{ChannelId, ClientMessage, PeerId, ServerMessage};
+
+/// How far a server's relay can be reached — chosen once, when the server
+/// is created, and baked into every invite link it ever mints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// Reachable from anywhere: the endpoint publishes itself to iroh's
+    /// public relay/DNS infrastructure, which handles rendezvous and
+    /// NAT hole-punching (with relayed fallback). Links carry only the
+    /// endpoint id.
+    #[default]
+    Global,
+    /// Reachable only by machines that can already route to this one —
+    /// same LAN, or a shared VPN such as Tailscale. Nothing is announced
+    /// to any public infrastructure; there is no relay fallback. Links
+    /// must carry the host's direct socket addresses, because there is
+    /// no discovery to resolve the endpoint id alone.
+    LocalNetwork,
+}
 
 /// The ALPN for room (chat/presence) connections. Bump the trailing number
 /// on any wire-format break — iroh refuses mismatched ALPNs at handshake,
@@ -100,8 +120,17 @@ type Rooms = Arc<Mutex<HashMap<ChannelId, HashMap<PeerId, mpsc::UnboundedSender<
 /// of the process — there's no shutdown handle yet, which is fine for a
 /// relay whose whole reason to exist is "as long as the host's app is
 /// open."
-pub async fn spawn(identity: &RelayIdentity) -> anyhow::Result<Relay> {
-    let endpoint = Endpoint::builder(presets::N0)
+pub async fn spawn(identity: &RelayIdentity, reach: Reach) -> anyhow::Result<Relay> {
+    let builder = match reach {
+        Reach::Global => Endpoint::builder(presets::N0),
+        // Minimal sets only the crypto provider: no address-lookup
+        // publishing, no discovery — and relaying is explicitly off, so
+        // nothing about this server ever touches public infrastructure.
+        Reach::LocalNetwork => {
+            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
+        }
+    };
+    let endpoint = builder
         .secret_key(SecretKey::from_bytes(&identity.secret))
         .alpns(vec![ALPN.to_vec(), MEDIA_ALPN.to_vec()])
         .bind()

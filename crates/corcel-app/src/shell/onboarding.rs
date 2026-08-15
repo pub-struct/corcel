@@ -68,6 +68,7 @@ impl Shell {
     pub(super) fn open_add_server_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.add_server_open = true;
         self.add_server_stage = AddServerStage::Choice;
+        self.server_reach = Reach::default();
         self.error = None;
         cx.notify();
     }
@@ -104,7 +105,7 @@ impl Shell {
         self.hosting_pending = true;
         cx.notify();
 
-        let rx = runtime::spawn_and_send(session::host(name));
+        let rx = runtime::spawn_and_send(session::host(name, self.server_reach));
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |shell, cx| {
@@ -486,6 +487,52 @@ impl Shell {
                             ),
                     );
 
+                // The reach fork, decided at creation and permanent for the
+                // server's life — so the copy says plainly what each choice
+                // trades away, instead of hiding it behind a settings page
+                // the user would only find after a confusing failure.
+                let reach_picker = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        reach_option_row(
+                            "reach-global",
+                            self.server_reach == Reach::Global,
+                            icons::LINK,
+                            "Reachable anywhere — recommended",
+                            "Friends connect from any network. iroh's public infrastructure \
+                             finds this machine and punches through NATs; traffic stays \
+                             end-to-end encrypted.",
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                                shell.server_reach = Reach::Global;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        reach_option_row(
+                            "reach-local",
+                            self.server_reach == Reach::LocalNetwork,
+                            icons::USERS,
+                            "Private network only",
+                            "Never announced to any public infrastructure. Only people who can \
+                             already reach this machine can join — same LAN, or a shared VPN \
+                             like Tailscale. The invite link carries your current IP, so share \
+                             a fresh one if it changes.",
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                                shell.server_reach = Reach::LocalNetwork;
+                                cx.notify();
+                            }),
+                        ),
+                    );
+
                 let cta = if self.hosting_pending {
                     theme::button(ButtonVariant::Primary, "Creating…").opacity(0.6)
                 } else {
@@ -500,6 +547,7 @@ impl Shell {
                     .w(px(430.))
                     .child(self.server_name_input.clone())
                     .child(preview)
+                    .child(reach_picker)
                     .child(
                         div()
                             .flex()
@@ -716,6 +764,62 @@ pub(super) fn manifesto_row(icon_path: &'static str, line: &'static str) -> Div 
                 .child(theme::icon(icon_path, px(18.)).text_color(rgba(0xffffffee))),
         )
         .child(div().text_size(px(13.5)).text_color(rgba(0xffffffcc)).child(line))
+}
+
+/// One selectable row of the Create stage's reach picker (anywhere vs.
+/// private network). The selected row gets the focus-ring border and a
+/// wash background; the whole row is the click target — callers attach
+/// `.on_mouse_up(...)`.
+pub(super) fn reach_option_row(
+    id: &'static str,
+    selected: bool,
+    icon_path: &'static str,
+    title: &'static str,
+    copy: &'static str,
+) -> Stateful<Div> {
+    let row = div()
+        .id(id)
+        .rounded_lg()
+        .border_1()
+        .p(px(12.))
+        .flex()
+        .items_start()
+        .gap(px(12.))
+        .cursor_pointer()
+        .child(
+            div()
+                .size(px(32.))
+                .rounded_md()
+                .flex_none()
+                .bg(if selected { theme::primary() } else { theme::wash() })
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(theme::icon(icon_path, px(15.)).text_color(if selected {
+                    theme::primary_foreground()
+                } else {
+                    theme::muted_foreground()
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .line_height(px(16.))
+                        .text_color(theme::muted_foreground())
+                        .child(copy),
+                ),
+        );
+    if selected {
+        row.border_color(theme::ring()).bg(theme::wash())
+    } else {
+        row.border_color(theme::border()).hover(|style| style.bg(theme::wash()))
+    }
 }
 
 /// One of the two big illustrated cards at the arrival fork (create vs.

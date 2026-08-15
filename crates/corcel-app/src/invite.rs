@@ -3,10 +3,12 @@
 //! discovery step (PROJECT.md decision 1 — the relay itself is unknown to
 //! anyone but the people who already have the link).
 
+use std::net::SocketAddr;
+
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use corcel_signal::{ChannelId, EndpointId};
+use corcel_signal::{ChannelId, EndpointAddr, EndpointId, Reach, TransportAddr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -47,7 +49,24 @@ pub struct ServerLink {
     /// anymore, see [`ServerLink::endpoint_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// How the relay is reachable ([`Reach::Global`] via iroh's public
+    /// infrastructure, or [`Reach::LocalNetwork`] over LAN/VPN routes
+    /// only). Defaulted so every link minted before the choice existed —
+    /// all of which were global — still decodes as what it was.
+    #[serde(default, skip_serializing_if = "reach_is_global")]
+    pub reach: Reach,
+    /// For [`Reach::LocalNetwork`] servers: the host's direct socket
+    /// addresses (LAN and/or VPN IPs) at the moment the link was minted.
+    /// With no public discovery to resolve the endpoint id, these are the
+    /// only routes — which is why local links go stale if the host's
+    /// address changes, and why the host regenerates them on every launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<SocketAddr>,
     pub channels: Vec<ChannelInfo>,
+}
+
+fn reach_is_global(reach: &Reach) -> bool {
+    *reach == Reach::Global
 }
 
 impl ServerLink {
@@ -63,9 +82,23 @@ impl ServerLink {
         node.parse().context("invite link carries an invalid endpoint id")
     }
 
+    /// Everything needed to dial the relay: the endpoint id, plus — for
+    /// [`Reach::LocalNetwork`] servers — the direct addresses the link
+    /// carries (there is no discovery to resolve the id alone).
+    pub fn endpoint_addr(&self) -> anyhow::Result<EndpointAddr> {
+        let addr = EndpointAddr::from(self.endpoint_id()?)
+            .with_addrs(self.addrs.iter().map(|addr| TransportAddr::Ip(*addr)));
+        Ok(addr)
+    }
+
     pub fn encode(&self) -> String {
         let json = serde_json::to_vec(self).expect("ServerLink always serializes");
         format!("corcel1{}", URL_SAFE_NO_PAD.encode(json))
+    }
+
+    #[cfg(test)]
+    fn roundtrip(&self) -> Self {
+        Self::decode(&self.encode()).expect("a just-encoded link always decodes")
     }
 
     pub fn decode(link: &str) -> anyhow::Result<Self> {
@@ -78,5 +111,63 @@ impl ServerLink {
             .context("not a corcel invite link")?;
         let json = URL_SAFE_NO_PAD.decode(payload).context("invite link is not valid base64")?;
         serde_json::from_slice(&json).context("invite link is malformed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_link() -> ServerLink {
+        ServerLink {
+            id: Uuid::new_v4(),
+            name: "test".to_string(),
+            node: None,
+            reach: Reach::Global,
+            addrs: Vec::new(),
+            channels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn local_network_links_carry_reach_and_addrs() {
+        let link = ServerLink {
+            reach: Reach::LocalNetwork,
+            addrs: vec!["100.64.1.2:4242".parse().unwrap(), "192.168.0.7:4242".parse().unwrap()],
+            ..base_link()
+        };
+        let decoded = link.roundtrip();
+        assert_eq!(decoded.reach, Reach::LocalNetwork);
+        assert_eq!(decoded.addrs, link.addrs);
+    }
+
+    #[test]
+    fn global_links_stay_free_of_local_fields() {
+        let encoded = base_link().encode();
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.strip_prefix("corcel1").unwrap())
+            .unwrap();
+        let json = String::from_utf8(json).unwrap();
+        // Wire-compat both ways: today's global links look exactly like the
+        // ones minted before reach existed.
+        assert!(!json.contains("reach"));
+        assert!(!json.contains("addrs"));
+    }
+
+    #[test]
+    fn links_minted_before_reach_existed_decode_as_global() {
+        let stripped = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "name": "old",
+            "channels": [],
+        });
+        let encoded = format!(
+            "corcel1{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&stripped).unwrap())
+        );
+        let decoded = ServerLink::decode(&encoded).unwrap();
+        assert_eq!(decoded.reach, Reach::Global);
+        assert!(decoded.addrs.is_empty());
     }
 }

@@ -27,7 +27,7 @@ use gpui::{
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-use corcel_signal::{ClientMessage, PeerId, RelayIdentity, ServerMessage};
+use corcel_signal::{ClientMessage, PeerId, Reach, RelayIdentity, ServerMessage};
 
 use crate::assets::icons;
 use crate::chat::{self, ChatMessage, ChatPayload, ReactionRow};
@@ -370,6 +370,10 @@ pub(crate) struct Shell {
     /// `true` from clicking "Create server" until the async host attempt
     /// resolves — renders the CTA dimmed/inert so the click visibly took.
     hosting_pending: bool,
+    /// The reach picked in the Create stage — what [`session::host`] is
+    /// called with. Resets to `Global` (the recommended choice) each time
+    /// the add-server flow is opened.
+    server_reach: Reach,
     /// Briefly `true` after "Copy Invite Link" so the button itself can
     /// confirm the copy happened — clipboard writes are otherwise invisible.
     link_copied: bool,
@@ -417,6 +421,7 @@ impl Shell {
             add_server_open: false,
             add_server_stage: AddServerStage::Choice,
             hosting_pending: false,
+            server_reach: Reach::default(),
             link_copied: false,
             error,
         };
