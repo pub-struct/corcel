@@ -1693,7 +1693,7 @@ impl Shell {
                 }
             }))
             .child(
-                div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(self.message_input.clone())).child(
+                div().w_full().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(self.message_input.clone())).child(
                     div()
                         .id("gif-picker-button")
                         .flex_none()
