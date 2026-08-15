@@ -208,8 +208,10 @@ impl Shell {
                     };
                     div()
                         .id(SharedString::from(format!("gif-{index}")))
-                        .w(px(118.))
-                        .h(px(88.))
+                        // 3 columns fill the panel exactly: 400 - 2px
+                        // borders - 16px padding = 382; (382 - 2*6 gaps)/3.
+                        .w(px(123.))
+                        .h(px(92.))
                         .rounded_md()
                         .overflow_hidden()
                         .cursor_pointer()
