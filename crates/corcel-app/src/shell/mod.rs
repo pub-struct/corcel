@@ -32,7 +32,7 @@ use corcel_signal::{ClientMessage, PeerId, Reach, RelayIdentity, ServerMessage};
 use crate::assets::icons;
 use crate::chat::{self, ChatMessage, ChatPayload, ReactionRow};
 use crate::invite::{ChannelInfo, ChannelKind, ServerLink};
-use crate::profile::Profile;
+use crate::profile::{self, Profile};
 use crate::session::{self, CallSession, CameraHandle, ScreenShareHandle};
 use crate::store::{self, SavedServer};
 use crate::text_input::TextInput;
@@ -347,6 +347,14 @@ pub(crate) struct Shell {
     /// `VoicePresence { present: false }` is swept out when the relay
     /// reports their room connection gone (`PeerLeft`).
     voice_occupants: HashMap<(Uuid, PeerId), String>,
+    /// Replicated peer avatars: author name → cached PNG on disk (see
+    /// [`profile::save_peer_avatar`]). Seeded from disk at startup,
+    /// updated whenever a `ChatPayload::Profile` arrives.
+    peer_avatars: HashMap<String, PathBuf>,
+    /// This user's avatar as it goes on the wire (base64 PNG), computed
+    /// lazily on the first room join and reused after — the outer `None`
+    /// means "not encoded yet", the inner one "user has no avatar".
+    encoded_avatar: Option<Option<String>>,
     /// The message the composer is currently replying to — stamped onto the
     /// next send as its `reply_to`, shown as a bar above the composer, and
     /// cleared by Escape, ✕, or sending.
@@ -416,6 +424,8 @@ impl Shell {
             last_typing_sent: None,
             speaking: HashMap::new(),
             voice_occupants: HashMap::new(),
+            peer_avatars: profile::load_peer_avatars(),
+            encoded_avatar: None,
             replying_to: None,
             editing: None,
             reacting_to: None,

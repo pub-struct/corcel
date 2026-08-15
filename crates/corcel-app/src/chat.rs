@@ -108,6 +108,15 @@ pub enum ChatPayload {
     /// stored, expires on the receiver's clock (the safety net for a peer
     /// that vanishes mid-word and never sends its `false`).
     Speaking { channel: ChannelId, author: String, speaking: bool },
+    /// "This is what I look like": the sender's display name and avatar
+    /// (base64 PNG, downscaled by the sender — see
+    /// [`crate::profile::encode_avatar`]). Broadcast on entering a room
+    /// and sent directly to every peer that joins afterwards, so everyone
+    /// online ends up with everyone's photo; receivers cache it on disk
+    /// (keyed by author) so it also survives restarts. `avatar: None`
+    /// means the sender has no photo set — receivers keep whatever they
+    /// had rather than un-setting it (no removal semantics yet).
+    Profile { author: String, avatar: Option<String> },
     /// "I'm connected to this voice channel" (`present: true`) or "I left
     /// it" (`false`) — what fills the roster under each voice channel.
     /// Broadcast on join/leave, re-broadcast on room reconnect, and sent

@@ -213,23 +213,31 @@ impl Shell {
                 if let Some(payload) = self.my_voice_presence(server_id) {
                     self.send_room(server_id, payload, None);
                 }
+                let my_profile = self.my_profile_payload();
+                self.send_room(server_id, my_profile, None);
                 let Some(peer) = peers.first().copied() else { return };
-                let since = self
-                    .store
-                    .as_ref()
-                    .and_then(|store| store.latest_timestamp(server_id).ok().flatten())
-                    .map(|latest| latest - chat::HISTORY_OVERLAP_MILLIS)
-                    .unwrap_or(0);
+                let since = self.history_since(server_id);
                 self.send_room(server_id, ChatPayload::HistoryRequest { since }, Some(peer));
             }
             // Someone entered the room: if we're in one of this server's
             // voice channels, tell them directly so late joiners see who's
             // already on a call (broadcasts only reach people already
-            // present when we joined the channel).
+            // present when we joined the channel). Their arrival is also
+            // our chance to catch up *from* them: if this side joined an
+            // empty room (nobody online to answer the RoomWelcome history
+            // request), this is the first moment history can flow at all —
+            // without it, a member who rejoins a quiet server stays empty
+            // until their next reconnect. Redundant when we're already
+            // caught up: the overlap window keeps the batch tiny and ids
+            // dedupe the rest.
             ServerMessage::PeerJoined { peer } => {
                 if let Some(payload) = self.my_voice_presence(server_id) {
                     self.send_room(server_id, payload, Some(peer));
                 }
+                let my_profile = self.my_profile_payload();
+                self.send_room(server_id, my_profile, Some(peer));
+                let since = self.history_since(server_id);
+                self.send_room(server_id, ChatPayload::HistoryRequest { since }, Some(peer));
             }
             // Someone's room connection dropped: whatever voice channel
             // they were in, they can no longer be signaling in it — this is
@@ -258,6 +266,7 @@ impl Shell {
                 Ok(ChatPayload::VoicePresence { channel, author, present }) => {
                     self.note_voice_presence(channel, from, author, present, cx);
                 }
+                Ok(ChatPayload::Profile { author, avatar }) => self.absorb_profile(author, avatar, cx),
                 _ => {}
             },
             ServerMessage::Direct { from, payload } => match serde_json::from_value(payload) {
@@ -280,12 +289,61 @@ impl Shell {
                 Ok(ChatPayload::VoicePresence { channel, author, present }) => {
                     self.note_voice_presence(channel, from, author, present, cx);
                 }
+                // The direct copy of a member's profile card, sent to us
+                // when we entered a room they were already in.
+                Ok(ChatPayload::Profile { author, avatar }) => self.absorb_profile(author, avatar, cx),
                 // Everything else (Typing, Edit, …) is broadcast-only; a
                 // direct one is a peer bug, and unparseable JSON is a newer
                 // build's payload — both dropped.
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// The `since` a history request for this server should carry: just
+    /// behind our newest stored message (see [`chat::HISTORY_OVERLAP_MILLIS`]),
+    /// or 0 — "send everything" — when the store is empty (fresh join, or
+    /// a rejoin after leaving wiped the server's history).
+    fn history_since(&self, server_id: Uuid) -> i64 {
+        self.store
+            .as_ref()
+            .and_then(|store| store.latest_timestamp(server_id).ok().flatten())
+            .map(|latest| latest - chat::HISTORY_OVERLAP_MILLIS)
+            .unwrap_or(0)
+    }
+
+    /// This user's profile card for the wire, with the avatar encoded on
+    /// first use and cached for every later room join/peer arrival (the
+    /// encode reads and rescales an image file — cheap once, not per peer).
+    fn my_profile_payload(&mut self) -> ChatPayload {
+        if self.encoded_avatar.is_none() {
+            let encoded = self
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.avatar_path.as_deref())
+                .and_then(profile::encode_avatar);
+            self.encoded_avatar = Some(encoded);
+        }
+        ChatPayload::Profile {
+            author: self.my_name(),
+            avatar: self.encoded_avatar.clone().flatten(),
+        }
+    }
+
+    /// Caches a peer's replicated avatar on disk and points the UI at it.
+    /// Our own name is ignored (we already have the original file), and so
+    /// is a photo-less card — see [`ChatPayload::Profile`] on why absence
+    /// doesn't un-set anything.
+    pub(super) fn absorb_profile(&mut self, author: String, avatar: Option<String>, cx: &mut Context<Self>) {
+        if author == self.my_name() {
+            return;
+        }
+        let Some(avatar) = avatar else { return };
+        let Some(path) = profile::save_peer_avatar(&author, &avatar) else { return };
+        if self.peer_avatars.get(&author) != Some(&path) {
+            self.peer_avatars.insert(author, path);
+            cx.notify();
         }
     }
 
@@ -741,10 +799,15 @@ impl Shell {
             .chat_messages
             .iter()
             .map(|message| {
-                // Only this user's avatar is known locally — everyone else
-                // renders as an initial until profiles replicate too.
+                // This user's avatar comes from their profile; everyone
+                // else's from the replicated cache (see
+                // [`Shell::absorb_profile`]), falling back to an initial.
                 let is_self = message.author == profile_name;
-                let avatar = if is_self { profile_avatar.clone() } else { None };
+                let avatar = if is_self {
+                    profile_avatar.clone()
+                } else {
+                    self.peer_avatars.get(&message.author).cloned()
+                };
                 let initial = message
                     .author
                     .trim()

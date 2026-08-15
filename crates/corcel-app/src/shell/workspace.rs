@@ -540,6 +540,7 @@ impl Shell {
                 let speaker_rows = roster.into_iter().map(|(name, speaking)| {
                     let initial: SharedString =
                         name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default().into();
+                    let avatar = self.peer_avatars.get(&name).cloned();
                     div()
                         .mx(px(8.))
                         .pl(px(26.))
@@ -548,7 +549,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(speaking_avatar(None, initial, 20., speaking))
+                        .child(speaking_avatar(avatar, initial, 20., speaking))
                         .child(
                             div()
                                 .flex_1()
