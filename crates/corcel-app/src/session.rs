@@ -1,11 +1,11 @@
 //! Glue between the UI and `corcel-signal`/`corcel-net`: creating a
-//! server (spawning a local signaling relay plus one host-relay per channel)
-//! and joining a channel (signaling connect + WebRTC handshake). No media is
-//! wired in yet — see PROJECT.md decision 6 for the host-relay topology this
-//! mirrors, and [`crate::session`]'s callers for how results cross back onto
-//! the GPUI thread.
+//! server (spawning a local relay plus its media forwarding task) and
+//! joining a channel (one QUIC media connection to the host). See
+//! PROJECT.md decision 6 for the host-relay topology this mirrors, and
+//! [`crate::session`]'s callers for how results cross back onto the GPUI
+//! thread.
 
-use corcel_net::{CallHandle, Participant};
+use corcel_net::{CallHandle, Participant, TrackKind};
 use corcel_signal::{ChannelId, ClientMessage, EndpointId, RelayIdentity};
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -35,10 +35,11 @@ pub async fn rehost(link: ServerLink, identity: RelayIdentity) -> anyhow::Result
     spawn_and_host(link.id, link.name, link.channels, &identity).await
 }
 
-/// Spawns the relay with `identity` and starts a host-side media relay for
-/// every *voice* channel (text channels need no host claim — chat flows
-/// through the relay's room, not a WebRTC session). Returns the link to
-/// share; everything in it is stable across launches.
+/// Spawns the relay with `identity` and starts the host-side media
+/// forwarding task that serves every voice channel of the server (each
+/// media connection's hello says which channel it belongs to — see
+/// [`corcel_net::HostRelay`]). Returns the link to share; everything in it
+/// is stable across launches.
 async fn spawn_and_host(
     server_id: Uuid,
     name: String,
@@ -48,24 +49,7 @@ async fn spawn_and_host(
     let relay = corcel_signal::relay::spawn(identity).await?;
     let relay_id = relay.endpoint_id;
 
-    for channel in &channels {
-        if channel.kind != ChannelKind::Voice {
-            continue;
-        }
-        let id = channel.id;
-        tokio::spawn(async move {
-            let conn = match corcel_signal::client::connect(relay_id, ClientMessage::Host { channel: id }).await {
-                Ok(conn) => conn,
-                Err(err) => {
-                    eprintln!("corcel-app: failed to host channel {id}: {err:#}");
-                    return;
-                }
-            };
-            if let Err(err) = corcel_net::HostRelay::run(conn).await {
-                eprintln!("corcel-app: host relay for channel {id} exited: {err:#}");
-            }
-        });
-    }
+    tokio::spawn(corcel_net::HostRelay::run(relay.media));
 
     Ok(ServerLink {
         id: server_id,
@@ -89,12 +73,10 @@ pub async fn open_room(
 
 /// Joins a channel already listed in `link` — host and guest use the exact
 /// same path (see [`corcel_signal::client`]'s doc comment on why the host
-/// also connects to its own relay as a plain participant, same as everyone
-/// else). Once connected, starts streaming mic audio in and remote audio
-/// out — see [`attach_media`].
+/// also dials its own relay, same as everyone else). Once connected, starts
+/// streaming mic audio in and remote audio out — see [`attach_media`].
 pub async fn join(link: ServerLink, channel: ChannelId) -> anyhow::Result<CallSession> {
-    let conn = corcel_signal::client::connect(link.endpoint_id()?, ClientMessage::Join { channel }).await?;
-    let participant = corcel_net::join(conn).await?;
+    let participant = corcel_net::join(link.endpoint_id()?, channel).await?;
     attach_media(participant).await
 }
 
@@ -149,13 +131,13 @@ pub struct CallSession {
 /// all of them, including ones spawned later for tracks that arrive after
 /// this function returns.
 async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
-    let Participant { pc, mut tracks, .. } = participant;
+    let Participant { pc, mut tracks } = participant;
     let (hang_up_tx, hang_up_rx) = watch::channel(false);
     let (mute_tx, mute_rx) = watch::channel(false);
     let (deafen_tx, deafen_rx) = watch::channel(false);
 
     let (mut mic, speaking_rx) = corcel_media::capture::microphone()?;
-    let outgoing = corcel_net::publish_audio_track(&pc).await?;
+    let outgoing = corcel_net::publish_audio_track(&pc);
     let mut stop_rx = hang_up_rx.clone();
     tokio::spawn(async move {
         loop {
@@ -166,7 +148,7 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
                     if *mute_rx.borrow() {
                         continue;
                     }
-                    if !outgoing.write_rtp(packet).await {
+                    if !outgoing.write_rtp(packet) {
                         break;
                     }
                 }
@@ -188,65 +170,66 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
                 track = tracks.recv() => track,
             };
             let Some(track) = track else { break };
+            let mut packets = track.packets;
 
-            if let Some(mut packets) = corcel_net::subscribe_audio(track.clone()).await {
-                let playback = match corcel_media::AudioPlayback::new() {
-                    Ok(playback) => playback,
-                    Err(err) => {
-                        eprintln!("corcel-app: failed to start audio playback: {err:#}");
-                        continue;
-                    }
-                };
-                let mut stop_rx = hang_up_rx.clone();
-                let deafen_rx = deafen_rx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = stop_rx.changed() => break,
-                            packet = packets.recv() => {
-                                let Some(packet) = packet else { break };
-                                // Deafened: drop instead of play — same
-                                // trustworthy shape as the mic loop's mute.
-                                if *deafen_rx.borrow() {
-                                    continue;
-                                }
-                                let _ = playback.push(&packet);
-                            }
+            match track.kind {
+                TrackKind::Audio => {
+                    let playback = match corcel_media::AudioPlayback::new() {
+                        Ok(playback) => playback,
+                        Err(err) => {
+                            eprintln!("corcel-app: failed to start audio playback: {err:#}");
+                            continue;
                         }
-                    }
-                });
-                continue;
-            }
-
-            if let Some(mut packets) = corcel_net::subscribe_video(track).await {
-                let mut playback = match corcel_media::VideoPlayback::new() {
-                    Ok(playback) => playback,
-                    Err(err) => {
-                        eprintln!("corcel-app: failed to start video playback: {err:#}");
-                        continue;
-                    }
-                };
-                let video_tx = video_tx.clone();
-                let mut stop_rx = hang_up_rx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = stop_rx.changed() => break,
-                            packet = packets.recv() => {
-                                let Some(packet) = packet else { break };
-                                let _ = playback.push(&packet);
-                            }
-                            frame = playback.frames.recv() => {
-                                let Some(frame) = frame else { break };
-                                match video_tx.try_send(frame) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    };
+                    let mut stop_rx = hang_up_rx.clone();
+                    let deafen_rx = deafen_rx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = stop_rx.changed() => break,
+                                packet = packets.recv() => {
+                                    let Some(packet) = packet else { break };
+                                    // Deafened: drop instead of play — same
+                                    // trustworthy shape as the mic loop's mute.
+                                    if *deafen_rx.borrow() {
+                                        continue;
+                                    }
+                                    let _ = playback.push(&packet);
                                 }
                             }
                         }
-                    }
-                });
+                    });
+                }
+                TrackKind::Video => {
+                    let mut playback = match corcel_media::VideoPlayback::new() {
+                        Ok(playback) => playback,
+                        Err(err) => {
+                            eprintln!("corcel-app: failed to start video playback: {err:#}");
+                            continue;
+                        }
+                    };
+                    let video_tx = video_tx.clone();
+                    let mut stop_rx = hang_up_rx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = stop_rx.changed() => break,
+                                packet = packets.recv() => {
+                                    let Some(packet) = packet else { break };
+                                    let _ = playback.push(&packet);
+                                }
+                                frame = playback.frames.recv() => {
+                                    let Some(frame) = frame else { break };
+                                    match video_tx.try_send(frame) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
             }
         }
     });
@@ -304,7 +287,7 @@ pub async fn start_camera(
     preview: mpsc::Sender<corcel_media::VideoFrame>,
 ) -> anyhow::Result<CameraHandle> {
     let mut capture = corcel_media::capture::camera(device)?;
-    let outgoing = corcel_net::publish_video_track(&pc).await?;
+    let outgoing = corcel_net::publish_video_track(&pc);
     let mut playback = corcel_media::VideoPlayback::new()?;
 
     let (stop_tx, mut stop_rx) = oneshot::channel();
@@ -315,7 +298,7 @@ pub async fn start_camera(
                 packet = capture.packets.recv() => {
                     let Some(packet) = packet else { break };
                     let _ = playback.push(&packet);
-                    if !outgoing.write_rtp(packet).await {
+                    if !outgoing.write_rtp(packet) {
                         break;
                     }
                 }
@@ -349,7 +332,7 @@ pub async fn start_screen_share(
     preview: mpsc::Sender<corcel_media::VideoFrame>,
 ) -> anyhow::Result<ScreenShareHandle> {
     let mut capture = corcel_media::capture::screen().await?;
-    let outgoing = corcel_net::publish_video_track(&pc).await?;
+    let outgoing = corcel_net::publish_video_track(&pc);
     let mut playback = corcel_media::VideoPlayback::new()?;
 
     let (stop_tx, mut stop_rx) = oneshot::channel();
@@ -360,7 +343,7 @@ pub async fn start_screen_share(
                 packet = capture.packets.recv() => {
                     let Some(packet) = packet else { break };
                     let _ = playback.push(&packet);
-                    if !outgoing.write_rtp(packet).await {
+                    if !outgoing.write_rtp(packet) {
                         break;
                     }
                 }

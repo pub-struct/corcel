@@ -174,12 +174,7 @@ struct ConnectedCall {
 /// the caller (a UI click handler) doesn't wait for this.
 fn hang_up(call: &ConnectedCall) {
     let _ = call.hang_up.send(true);
-    let pc = call.pc.clone();
-    // The returned completion receiver is deliberately dropped — the tokio
-    // task keeps running to completion regardless; nobody needs its result.
-    drop(runtime::spawn_and_send(async move {
-        let _ = pc.close().await;
-    }));
+    call.pc.close();
 }
 
 /// Drops the stage's current frame (and its GPU texture) so stopping your
