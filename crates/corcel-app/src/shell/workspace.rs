@@ -796,6 +796,7 @@ impl Shell {
                 .justify_center()
                 .child(
                     div()
+                        .max_w(px(600.))
                         .flex()
                         .items_center()
                         .gap(px(8.))
@@ -812,6 +813,11 @@ impl Shell {
                         .child(
                             theme::icon_button("dismiss-error", icons::X, "Dismiss")
                                 .on_mouse_up(MouseButton::Left, cx.listener(Self::dismiss_error_clicked)),
+                        )
+                        .with_animation(
+                            "error-toast-in",
+                            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+                            |toast, delta| toast.opacity(delta).mt(px(-12. * (1. - delta))),
                         ),
                 )
         });
@@ -845,6 +851,8 @@ impl Shell {
                     )
                     .child(
                         div()
+                            .max_w(px(600.))
+                            .text_center()
                             .text_size(px(18.))
                             .font_weight(FontWeight::BOLD)
                             .child(format!("Welcome to {server_name}")),

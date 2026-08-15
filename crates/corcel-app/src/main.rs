@@ -13,7 +13,12 @@ mod store;
 mod text_input;
 mod theme;
 
-use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size};
+use gpui::{
+    App, Application, Bounds, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, actions, point,
+    prelude::*, px, size,
+};
+
+actions!(corcel, [Quit]);
 
 use shell::Shell;
 
@@ -45,6 +50,29 @@ fn main() {
 
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         text_input::init(cx);
+
+        // A real application menu. Besides giving Cmd+Q/Cmd+, their usual
+        // meanings, this is what makes macOS's auto-hidden menu bar reveal
+        // at the top of the screen while corcel is frontmost — with no
+        // main menu registered there is nothing for the system to show,
+        // so the bar simply never came down.
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![
+            Menu {
+                name: "corcel".into(),
+                items: vec![MenuItem::action("Quit corcel", Quit)],
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Cut", text_input::Cut),
+                    MenuItem::action("Copy", text_input::Copy),
+                    MenuItem::action("Paste", text_input::Paste),
+                    MenuItem::action("Select All", text_input::SelectAll),
+                ],
+            },
+        ]);
 
         // Open at 90% of the primary display, centered — the window stays
         // freely resizable (GPUI's default) down to the min size below.

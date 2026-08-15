@@ -207,6 +207,11 @@ impl Shell {
                     .text_size(px(10.5))
                     .text_color(theme::faint_foreground())
                     .child("↑↓ to navigate · Enter to jump · Esc to close"),
+            )
+            .with_animation(
+                "switcher-in",
+                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                |card, delta| card.opacity(delta).mt(px(-10. * (1. - delta))),
             );
 
         div()

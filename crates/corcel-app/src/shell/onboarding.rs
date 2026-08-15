@@ -150,6 +150,11 @@ impl Shell {
                         theme::button(ButtonVariant::Primary, "Save")
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::save_edited_profile_clicked)),
                     ),
+            )
+            .with_animation(
+                "edit-profile-in",
+                Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                |card, delta| card.opacity(delta).mt(px(14. * (1. - delta))),
             );
 
         div()
@@ -933,6 +938,11 @@ pub(super) fn reach_option_row(
         )
         .child(
             div()
+                // Without flex_1 + min_w_0 the copy's intrinsic single-line
+                // width wins over the card's width and paints clean past
+                // the modal — the app-wide overflow bug's poster child.
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(3.))

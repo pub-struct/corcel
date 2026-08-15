@@ -997,6 +997,8 @@ impl Shell {
                     div()
                         .text_size(px(16.))
                         .font_weight(FontWeight::BOLD)
+                        .max_w(px(600.))
+                        .text_center()
                         .child(format!("Welcome to #{}", channel.name)),
                 )
                 .child(
@@ -1245,6 +1247,11 @@ impl Shell {
                                     .flex()
                                     .flex_col()
                                     .children(sections),
+                            )
+                            .with_animation(
+                                SharedString::from(format!("emoji-picker-in-{message_id}")),
+                                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                                |picker, delta| picker.opacity(delta).mt(px(6. * (1. - delta))),
                             ),
                     )
                 });
@@ -1448,6 +1455,9 @@ impl Shell {
             .flex_none()
             .h(px(18.))
             .px(px(16.))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
             .text_size(px(11.5))
             .text_color(theme::muted_foreground())
             .child(typing_label);
@@ -1470,12 +1480,17 @@ impl Shell {
                 .text_color(theme::muted_foreground())
                 .child(
                     div()
+                        .min_w_0()
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .child("Replying to")
+                        .child(div().flex_none().child("Replying to"))
                         .child(
                             div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::foreground())
                                 .child(author),
@@ -1543,7 +1558,15 @@ impl Shell {
                                 }),
                             )
                             .child(theme::avatar(avatar, initial, px(22.)))
-                            .child(div().text_size(px(13.)).child(name.clone()))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(13.))
+                                    .child(name.clone()),
+                            )
                     })
                     .collect();
                 Some(
@@ -1560,7 +1583,12 @@ impl Shell {
                             .border_1()
                             .border_color(theme::border())
                             .shadow_md()
-                            .children(rows),
+                            .children(rows)
+                            .with_animation(
+                                "mention-popup-in",
+                                Animation::new(Duration::from_millis(120)).with_easing(ease_out_quint()),
+                                |popup, delta| popup.opacity(delta).mt(px(4. * (1. - delta))),
+                            ),
                     ),
                 )
             });
@@ -1624,9 +1652,16 @@ impl Shell {
 
         // The thread panel takes the member panel's slot while open —
         // both at once would crowd the chat out of narrow windows.
-        let side_panel = match self.open_thread.clone() {
-            Some(root) => self.render_thread_panel(root, profile, cx),
-            None => self.render_member_panel(profile, cx),
+        let side_panel: AnyElement = match self.open_thread.clone() {
+            Some(root) => self
+                .render_thread_panel(root, profile, cx)
+                .with_animation(
+                    "thread-panel-in",
+                    Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                    |panel, delta| panel.w(px(320. * delta)),
+                )
+                .into_any_element(),
+            None => self.render_member_panel(profile, cx).into_any_element(),
         };
 
         div().flex_1().min_w_0().h_full().flex().child(chat_column).child(side_panel)
@@ -1680,12 +1715,17 @@ impl Shell {
                                 .gap(px(6.))
                                 .child(
                                     div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .text_size(px(13.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(message.author.clone()),
                                 )
                                 .child(
                                     div()
+                                        .flex_none()
                                         .text_size(px(10.5))
                                         .text_color(theme::faint_foreground())
                                         .child(format_timestamp(message.sent_at)),
@@ -1745,6 +1785,7 @@ impl Shell {
             .w(px(320.))
             .h_full()
             .flex_none()
+            .overflow_hidden()
             .border_l_1()
             .border_color(theme::border())
             .bg(theme::card())

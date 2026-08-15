@@ -848,7 +848,12 @@ impl Shell {
                                 "Sharpest — most bandwidth",
                                 corcel_media::ScreenShareQuality::Qhd1440,
                                 cx,
-                            )),
+                            ))
+                            .with_animation(
+                                "share-quality-in",
+                                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                                |menu, delta| menu.opacity(delta).mt(px(8. * (1. - delta))),
+                            ),
                     ),
                 )
             }
@@ -892,13 +897,31 @@ pub(super) fn stage_tile(
     speaking: bool,
 ) -> Div {
     div()
+        .max_w(px(420.))
         .flex()
         .flex_col()
         .items_center()
         .gap(px(12.))
         .child(speaking_avatar(avatar, initial.into(), 80., speaking))
-        .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(theme::foreground()).child(name.into()))
-        .child(div().text_size(px(12.5)).text_color(theme::muted_foreground()).child(caption.into()))
+        .child(
+            div()
+                .max_w_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(14.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::foreground())
+                .child(name.into()),
+        )
+        .child(
+            div()
+                .max_w_full()
+                .text_center()
+                .text_size(px(12.5))
+                .text_color(theme::muted_foreground())
+                .child(caption.into()),
+        )
 }
 
 /// A round 44px call-control button for the in-call bar. `pending` renders
