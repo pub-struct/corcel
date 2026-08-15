@@ -56,6 +56,11 @@ impl Shell {
             avatar_path: self.profile_form.avatar_path.clone(),
             banner_path: self.profile_form.banner_path.clone(),
             bio: (!bio.is_empty()).then_some(bio),
+            created_at: self
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.created_at)
+                .or_else(|| Some(chat::now_millis())),
         };
         if let Err(err) = profile.save() {
             self.profile_form.error = Some(format!("couldn't save profile: {err:#}"));
@@ -465,7 +470,7 @@ impl Shell {
             .child(theme::icon(icons::PENCIL, px(12.)).text_color(theme::muted_foreground()));
 
         let card = div()
-            .w(px(340.))
+            .w(px(380.))
             .rounded_xl()
             .overflow_hidden()
             .bg(theme::card())
@@ -475,7 +480,7 @@ impl Shell {
             .child(
                 div()
                     .id("banner-picker")
-                    .h(px(110.))
+                    .h(px(140.))
                     .w_full()
                     .cursor_pointer()
                     .active(|style| style.opacity(0.9))
@@ -483,11 +488,11 @@ impl Shell {
                     .child(banner),
             )
             .child(
-                div().px(px(20.)).mt(px(-40.)).child(
+                div().px(px(20.)).mt(px(-48.)).child(
                     div()
                         .id("avatar-picker")
                         .relative()
-                        .w(px(88.))
+                        .w(px(100.))
                         .cursor_pointer()
                         .active(|style| style.opacity(0.9))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::pick_avatar_clicked))
@@ -496,7 +501,18 @@ impl Shell {
                                 .rounded_full()
                                 .border_4()
                                 .border_color(theme::card())
-                                .child(theme::avatar(self.profile_form.avatar_path.clone(), initial, px(80.))),
+                                .child(theme::avatar(self.profile_form.avatar_path.clone(), initial, px(92.))),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom(px(4.))
+                                .right(px(4.))
+                                .size(px(22.))
+                                .rounded_full()
+                                .border_4()
+                                .border_color(theme::card())
+                                .bg(theme::success()),
                         )
                         .child(avatar_badge),
                 ),
@@ -511,6 +527,20 @@ impl Shell {
                     .gap(px(12.))
                     .child(self.profile_form.name_input.clone())
                     .child(self.profile_form.bio_input.clone())
+                    .children(self.profile.as_ref().and_then(|profile| profile.created_at).map(|at| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::muted_foreground())
+                                    .child("MEMBER SINCE"),
+                            )
+                            .child(div().text_size(px(13.)).child(member_since(at)))
+                    }))
                     .children(self.profile_form.avatar_path.is_some().then(|| {
                         div()
                             .id("remove-avatar")
@@ -1035,4 +1065,13 @@ pub(super) fn arrival_choice_card(
                     div().mt(px(4.)).text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(accent).child(cta),
                 ),
         )
+}
+
+/// "3 Feb 2019"-style date for the profile card's Member Since row.
+fn member_since(millis: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(millis).single() {
+        Some(time) => time.format("%-d %b %Y").to_string(),
+        None => "—".to_string(),
+    }
 }

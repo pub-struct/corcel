@@ -13,6 +13,11 @@ pub struct Profile {
     pub avatar_path: Option<PathBuf>,
     pub banner_path: Option<PathBuf>,
     pub bio: Option<String>,
+    /// Unix millis of the first profile save on this machine — the
+    /// "Member since" date. `default` keeps pre-existing profiles
+    /// loading; they adopt a date on their next save.
+    #[serde(default)]
+    pub created_at: Option<i64>,
 }
 
 impl Profile {
