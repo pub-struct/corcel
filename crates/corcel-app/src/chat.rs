@@ -108,6 +108,15 @@ pub enum ChatPayload {
     /// stored, expires on the receiver's clock (the safety net for a peer
     /// that vanishes mid-word and never sends its `false`).
     Speaking { channel: ChannelId, author: String, speaking: bool },
+    /// "I'm connected to this voice channel" (`present: true`) or "I left
+    /// it" (`false`) — what fills the roster under each voice channel.
+    /// Broadcast on join/leave, re-broadcast on room reconnect, and sent
+    /// directly to peers who enter the room mid-call so late joiners see
+    /// who's already talking. Ephemeral like [`ChatPayload::Typing`], but
+    /// with a different safety net: receivers key entries by the sender's
+    /// *room peer id*, so when a member's app dies without saying `false`,
+    /// the relay's `PeerLeft` sweeps their roster row out.
+    VoicePresence { channel: ChannelId, author: String, present: bool },
 }
 
 /// The author's current unix time in milliseconds — the timestamp stamped

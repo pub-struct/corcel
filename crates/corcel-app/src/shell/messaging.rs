@@ -204,6 +204,15 @@ impl Shell {
             // by asking *any* online member — the first peer is as good as
             // any, since everyone replicates everything.
             ServerMessage::RoomWelcome { peers, .. } => {
+                // A (re)connect resets what we know about this server's
+                // voice rosters: everyone's peer ids are new, and we missed
+                // any join/leave while disconnected. Others repopulate it
+                // by reacting to our PeerJoined (below); we re-announce our
+                // own presence in case we reconnected mid-call.
+                self.clear_voice_occupants(server_id);
+                if let Some(payload) = self.my_voice_presence(server_id) {
+                    self.send_room(server_id, payload, None);
+                }
                 let Some(peer) = peers.first().copied() else { return };
                 let since = self
                     .store
@@ -213,7 +222,27 @@ impl Shell {
                     .unwrap_or(0);
                 self.send_room(server_id, ChatPayload::HistoryRequest { since }, Some(peer));
             }
-            ServerMessage::Published { payload, .. } => match serde_json::from_value(payload) {
+            // Someone entered the room: if we're in one of this server's
+            // voice channels, tell them directly so late joiners see who's
+            // already on a call (broadcasts only reach people already
+            // present when we joined the channel).
+            ServerMessage::PeerJoined { peer } => {
+                if let Some(payload) = self.my_voice_presence(server_id) {
+                    self.send_room(server_id, payload, Some(peer));
+                }
+            }
+            // Someone's room connection dropped: whatever voice channel
+            // they were in, they can no longer be signaling in it — this is
+            // the crash-safety sweep for members who never said
+            // `present: false`.
+            ServerMessage::PeerLeft { peer } => {
+                let before = self.voice_occupants.len();
+                self.voice_occupants.retain(|(_, occupant), _| *occupant != peer);
+                if self.voice_occupants.len() != before {
+                    cx.notify();
+                }
+            }
+            ServerMessage::Published { from, payload } => match serde_json::from_value(payload) {
                 Ok(ChatPayload::Message(message)) => self.absorb_messages(server_id, vec![message], cx),
                 Ok(ChatPayload::Typing { channel, author }) => self.note_typing(channel, author, cx),
                 Ok(ChatPayload::Edit { message_id, channel, edited_at, body }) => {
@@ -225,6 +254,9 @@ impl Shell {
                 Ok(ChatPayload::Reaction(reaction)) => self.absorb_reactions(server_id, vec![reaction], cx),
                 Ok(ChatPayload::Speaking { channel, author, speaking }) => {
                     self.note_speaking(channel, author, speaking, cx);
+                }
+                Ok(ChatPayload::VoicePresence { channel, author, present }) => {
+                    self.note_voice_presence(channel, from, author, present, cx);
                 }
                 _ => {}
             },
@@ -243,6 +275,11 @@ impl Shell {
                     self.absorb_reactions(server_id, reactions, cx);
                 }
                 Ok(ChatPayload::Message(message)) => self.absorb_messages(server_id, vec![message], cx),
+                // The direct copy sent to a peer who entered the room while
+                // we were already in a voice channel (see PeerJoined above).
+                Ok(ChatPayload::VoicePresence { channel, author, present }) => {
+                    self.note_voice_presence(channel, from, author, present, cx);
+                }
                 // Everything else (Typing, Edit, …) is broadcast-only; a
                 // direct one is a peer bug, and unparseable JSON is a newer
                 // build's payload — both dropped.
@@ -397,6 +434,56 @@ impl Shell {
         if changed {
             cx.notify();
         }
+    }
+
+    /// Records someone joining or leaving a voice channel, keyed by their
+    /// room peer id (see the `voice_occupants` field for why).
+    pub(super) fn note_voice_presence(
+        &mut self,
+        channel: Uuid,
+        peer: PeerId,
+        author: String,
+        present: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if author == self.my_name() {
+            return;
+        }
+        let changed = if present {
+            self.voice_occupants.insert((channel, peer), author).is_none()
+        } else {
+            self.voice_occupants.remove(&(channel, peer)).is_some()
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Forgets everything known about who's in this server's voice channels
+    /// — used when (re)entering its room, since occupant entries are keyed
+    /// by peer ids from the previous connection.
+    pub(super) fn clear_voice_occupants(&mut self, server_id: Uuid) {
+        let channels: Vec<Uuid> = self
+            .servers
+            .iter()
+            .find(|s| s.link.id == server_id)
+            .map(|s| s.link.channels.iter().map(|c| c.id).collect())
+            .unwrap_or_default();
+        self.voice_occupants.retain(|(channel, _), _| !channels.contains(channel));
+    }
+
+    /// The VoicePresence payload describing this user's own current call on
+    /// `server_id`, if they're connected to one of its voice channels.
+    pub(super) fn my_voice_presence(&self, server_id: Uuid) -> Option<ChatPayload> {
+        let call = self.call.as_ref()?;
+        if call.server_id != server_id || !matches!(call.status, ChannelStatus::Connected(_)) {
+            return None;
+        }
+        Some(ChatPayload::VoicePresence {
+            channel: call.channel.id,
+            author: self.my_name(),
+            present: true,
+        })
     }
 
     /// Called on every keystroke that lands in the composer: broadcasts a

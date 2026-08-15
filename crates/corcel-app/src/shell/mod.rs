@@ -342,6 +342,12 @@ pub(crate) struct Shell {
     /// Speaking { true } seen`. Cleared by their explicit `false`, or aged
     /// out by the janitor if that never arrives (see [`SPEAKING_EXPIRY`]).
     speaking: HashMap<(Uuid, String), Instant>,
+    /// Who's connected to which voice channel, as learned over the chat
+    /// room: `(voice channel, room peer) → display name`. Keyed by peer id
+    /// (not name) so a member whose app dies without sending
+    /// `VoicePresence { present: false }` is swept out when the relay
+    /// reports their room connection gone (`PeerLeft`).
+    voice_occupants: HashMap<(Uuid, PeerId), String>,
     /// The message the composer is currently replying to — stamped onto the
     /// next send as its `reply_to`, shown as a bar above the composer, and
     /// cleared by Escape, ✕, or sending.
@@ -406,6 +412,7 @@ impl Shell {
             typing: HashMap::new(),
             last_typing_sent: None,
             speaking: HashMap::new(),
+            voice_occupants: HashMap::new(),
             replying_to: None,
             editing: None,
             reacting_to: None,

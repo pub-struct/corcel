@@ -421,15 +421,27 @@ impl Shell {
             })
             .collect::<Vec<_>>();
 
-        // Remote members currently talking, per voice channel — the only
-        // presence the app has for other people in voice (no roster
-        // exchange yet), so rows appear while they speak and age out after.
-        let mut remote_speakers: HashMap<Uuid, Vec<String>> = HashMap::new();
-        for (channel_id, author) in self.speaking.keys() {
-            remote_speakers.entry(*channel_id).or_default().push(author.clone());
+        // The remote roster per voice channel: everyone whose VoicePresence
+        // says they're connected, with their speaking ring lit while the
+        // speaking map holds them. Members still on builds without
+        // VoicePresence appear the old way — only while audibly talking.
+        let mut remote_roster: HashMap<Uuid, Vec<(String, bool)>> = HashMap::new();
+        for ((channel_id, _), author) in &self.voice_occupants {
+            let speaking = self.speaking.contains_key(&(*channel_id, author.clone()));
+            remote_roster.entry(*channel_id).or_default().push((author.clone(), speaking));
         }
-        for speakers in remote_speakers.values_mut() {
-            speakers.sort();
+        for (channel_id, author) in self.speaking.keys() {
+            let rows = remote_roster.entry(*channel_id).or_default();
+            if !rows.iter().any(|(name, _)| name == author) {
+                rows.push((author.clone(), true));
+            }
+        }
+        for rows in remote_roster.values_mut() {
+            // Same display name twice (two peers, one name): keep one row,
+            // lit if either is speaking — speaking sorts first, dedup keeps
+            // the first.
+            rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            rows.dedup_by(|a, b| a.0 == b.0);
         }
 
         let voice_rows = server
@@ -522,10 +534,10 @@ impl Shell {
                         )
                 });
 
-                // Whoever else is audibly talking in this channel right now
-                // (rows come and go with their voice — see remote_speakers).
-                let speakers = remote_speakers.get(&channel.id).cloned().unwrap_or_default();
-                let speaker_rows = speakers.into_iter().map(|name| {
+                // Everyone else in this channel (see remote_roster), ring
+                // lit while they're audibly talking.
+                let roster = remote_roster.get(&channel.id).cloned().unwrap_or_default();
+                let speaker_rows = roster.into_iter().map(|(name, speaking)| {
                     let initial: SharedString =
                         name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default().into();
                     div()
@@ -536,7 +548,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(speaking_avatar(None, initial, 20., true))
+                        .child(speaking_avatar(None, initial, 20., speaking))
                         .child(
                             div()
                                 .flex_1()

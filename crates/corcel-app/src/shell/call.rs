@@ -23,14 +23,20 @@ impl Shell {
                 return;
             }
             // Switching calls: tear the old one down first (and clear our
-            // speaking ring there — its watcher dies with it).
+            // speaking ring and roster row there — the watcher dies with
+            // it, and nobody else can say we left).
             if let ChannelStatus::Connected(connected) = &call.status {
                 hang_up(connected);
                 let (old_server, old_channel) = (call.server_id, call.channel.id);
                 let author = self.my_name();
                 self.send_room(
                     old_server,
-                    ChatPayload::Speaking { channel: old_channel, author, speaking: false },
+                    ChatPayload::Speaking { channel: old_channel, author: author.clone(), speaking: false },
+                    None,
+                );
+                self.send_room(
+                    old_server,
+                    ChatPayload::VoicePresence { channel: old_channel, author, present: false },
                     None,
                 );
             }
@@ -99,7 +105,15 @@ impl Shell {
                 };
                 if let Some(active) = shell.call.as_mut().filter(|active| active.channel.id == channel_id) {
                     active.status = ChannelStatus::Connected(call);
+                    let server_id = active.server_id;
                     shell.spawn_speaking_watcher(channel_id, speaking, cx);
+                    // Take our seat on everyone's roster for this channel.
+                    let author = shell.my_name();
+                    shell.send_room(
+                        server_id,
+                        ChatPayload::VoicePresence { channel: channel_id, author, present: true },
+                        None,
+                    );
                     cx.notify();
                     return Some(surface);
                 }
@@ -142,11 +156,16 @@ impl Shell {
             hang_up(connected);
             // The speaking watcher dies with the call and can't say this
             // for us — clear our ring for everyone explicitly rather than
-            // leaving it to their expiry timer.
+            // leaving it to their expiry timer, and vacate our roster row.
             let author = self.my_name();
             self.send_room(
                 call.server_id,
-                ChatPayload::Speaking { channel: call.channel.id, author, speaking: false },
+                ChatPayload::Speaking { channel: call.channel.id, author: author.clone(), speaking: false },
+                None,
+            );
+            self.send_room(
+                call.server_id,
+                ChatPayload::VoicePresence { channel: call.channel.id, author, present: false },
                 None,
             );
         }
