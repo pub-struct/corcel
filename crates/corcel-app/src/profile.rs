@@ -42,14 +42,20 @@ impl Profile {
     }
 }
 
-/// `$XDG_CONFIG_HOME/corcel`, falling back to `$HOME/.config/corcel`, then
-/// just `./corcel` if neither is set. Everything the app persists —
+/// `$XDG_CONFIG_HOME/corcel`, falling back to `$HOME/.config/corcel`
+/// (`%APPDATA%\corcel` on Windows, which has no `$HOME`), then just
+/// `./corcel` if nothing is set. Everything the app persists —
 /// `profile.json` and the database — lives in this one directory so the
-/// user can find, back up, or delete it all in one place.
+/// user can find, back up, or delete it all in one place. The XDG
+/// override is honored everywhere, so tests can redirect it on any OS.
 pub fn config_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    let fallback = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(target_os = "windows"))]
+    let fallback = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"));
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .or(fallback)
         .unwrap_or_else(|| PathBuf::from("."));
     config_home.join("corcel")
 }
