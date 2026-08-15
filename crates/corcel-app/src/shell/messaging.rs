@@ -9,6 +9,10 @@ use super::*;
 /// Discord staples, one click away without scrolling.
 const REACTION_PALETTE: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "🎉"];
 
+/// The thread side panel's width — roomy enough that replies read like a
+/// conversation, not a ticker.
+const THREAD_PANEL_WIDTH: f32 = 400.;
+
 /// The full picker, by category. Curated rather than exhaustive — a
 /// friends-scale set that covers what people actually react with, kept
 /// to single-codepoint-ish emoji that every platform's fallback font
@@ -1752,7 +1756,7 @@ impl Shell {
                 .with_animation(
                     "thread-panel-in",
                     Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
-                    |panel, delta| panel.w(px(320. * delta)),
+                    |panel, delta| panel.w(px(THREAD_PANEL_WIDTH * delta)),
                 )
                 .into_any_element(),
             None => self.render_member_panel(profile, cx).into_any_element(),
@@ -1876,7 +1880,7 @@ impl Shell {
             .child(self.thread_input.clone());
 
         div()
-            .w(px(320.))
+            .w(px(THREAD_PANEL_WIDTH))
             .h_full()
             .flex_none()
             .overflow_hidden()
