@@ -596,6 +596,17 @@ impl Shell {
         })
         .detach();
 
+        // Search-as-you-type for the GIF picker rides entity observation,
+        // not key bubbling — editing keys like Backspace are consumed by
+        // the input's own bindings and never reach an ancestor's
+        // on_key_down. Every edit notifies; the debounce dedupes.
+        cx.observe(&shell.gif_input, |shell, _, cx| {
+            if shell.gif_picker_open {
+                shell.gif_query_changed(cx);
+            }
+        })
+        .detach();
+
         // Dev shortcut: CORCEL_DEBUG_CHANNEL=1 opens the first server's
         // first text channel on launch, so chat UI can be screenshotted
         // and iterated on without clicking through navigation.

@@ -265,8 +265,6 @@ impl Shell {
                                 shell.gif_search_generation += 1;
                                 let query = shell.gif_input.read(cx).content.trim().to_string();
                                 shell.search_gifs(query, cx);
-                            } else {
-                                shell.gif_query_changed(cx);
                             }
                         }))
                         .child(self.gif_input.clone()),
