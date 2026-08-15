@@ -49,7 +49,19 @@ pub(super) enum ContextAction {
     MarkChannelRead { channel: Uuid },
     ToggleSelfMute,
     ToggleSelfDeafen,
+    Reply { message: ChatMessage },
+    ReplyInThread { message: ChatMessage },
+    CopyMessageText { body: String },
+    AddReaction { message: Uuid },
+    EditMessage { message: ChatMessage },
+    DeleteMessage { message: Uuid },
+    CopyInvite { server: Uuid },
+    MarkAllRead { server: Uuid },
+    MentionUser { author: String },
     EditChannelName { channel: Uuid },
+    MuteChannel { channel: Uuid },
+    LeaveServer { server: Uuid },
+    ViewProfile { author: String },
     AdjustUserVolume { author: String },
     KickFromVoice { author: String },
 }
@@ -71,7 +83,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn run_context_action(&mut self, action: ContextAction, cx: &mut Context<Self>) {
+    pub(super) fn run_context_action(&mut self, action: ContextAction, window: &mut Window, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
         match action {
             ContextAction::MarkChannelRead { channel } => {
@@ -85,9 +97,53 @@ impl Shell {
                 cx.notify();
             }
             ContextAction::ToggleSelfDeafen => self.toggle_deafen(cx),
+            ContextAction::Reply { message } => self.start_reply(message, window, cx),
+            ContextAction::ReplyInThread { message } => self.open_thread(message, cx),
+            ContextAction::CopyMessageText { body } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(body));
+            }
+            ContextAction::AddReaction { message } => {
+                self.reacting_to = Some(message);
+                cx.notify();
+            }
+            ContextAction::EditMessage { message } => self.start_edit(&message, window, cx),
+            ContextAction::DeleteMessage { message } => self.delete_message(message, cx),
+            ContextAction::CopyInvite { server } => {
+                if let Some(server) = self.servers.iter().find(|s| s.link.id == server) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(server.link.encode()));
+                }
+            }
+            ContextAction::MarkAllRead { server } => {
+                let channels: Vec<Uuid> = self
+                    .servers
+                    .iter()
+                    .find(|s| s.link.id == server)
+                    .map(|s| s.link.channels.iter().map(|c| c.id).collect())
+                    .unwrap_or_default();
+                for channel in channels {
+                    self.mark_channel_read(channel);
+                }
+                cx.notify();
+            }
+            ContextAction::MentionUser { author } => {
+                let content = {
+                    let input = self.message_input.read(cx);
+                    let content = input.content.to_string();
+                    if content.is_empty() || content.ends_with(char::is_whitespace) {
+                        format!("{content}@{author} ")
+                    } else {
+                        format!("{content} @{author} ")
+                    }
+                };
+                self.message_input.update(cx, |input, cx| input.set_content(content, cx));
+                window.focus(&self.message_input.focus_handle(cx));
+            }
             // Sketched, not shipped — their rows render with a "soon" chip
             // and never dispatch (see `ContextMenuItem::soon`).
             ContextAction::EditChannelName { .. }
+            | ContextAction::MuteChannel { .. }
+            | ContextAction::LeaveServer { .. }
+            | ContextAction::ViewProfile { .. }
             | ContextAction::AdjustUserVolume { .. }
             | ContextAction::KickFromVoice { .. } => {}
         }
@@ -125,8 +181,8 @@ impl Shell {
                     let action = item.action.clone();
                     row.cursor_pointer().hover(|style| style.bg(theme::wash_strong())).on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(move |shell, _, _window, cx| {
-                            shell.run_context_action(action.clone(), cx);
+                        cx.listener(move |shell, _, window, cx| {
+                            shell.run_context_action(action.clone(), window, cx);
                         }),
                     )
                 } else {
@@ -157,7 +213,10 @@ impl Shell {
                 .gap(px(1.))
                 .p(px(4.))
                 .rounded_lg()
-                .bg(theme::glass())
+                // More frost than the call bar: GPUI has no per-element
+                // backdrop blur, so a see-through menu reads as leaky
+                // rather than glassy — near-opaque like Discord's.
+                .bg(theme::popover())
                 .border_1()
                 .border_color(theme::glass_edge())
                 .shadow_lg()

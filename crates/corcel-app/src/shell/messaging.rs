@@ -1364,9 +1364,57 @@ impl Shell {
                     bar
                 });
 
+                let menu_message = message.clone();
+                let menu_is_self = is_self;
                 div()
                     .relative()
                     .group(group_name)
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |shell, event, _window, cx| {
+                            if menu_message.deleted {
+                                return;
+                            }
+                            let mut items = vec![
+                                ContextMenuItem::new(
+                                    "Reply",
+                                    icons::REPLY,
+                                    ContextAction::Reply { message: menu_message.clone() },
+                                ),
+                                ContextMenuItem::new(
+                                    "Reply in thread",
+                                    icons::MESSAGE_SQUARE,
+                                    ContextAction::ReplyInThread { message: menu_message.clone() },
+                                ),
+                                ContextMenuItem::new(
+                                    "Add reaction",
+                                    icons::SMILE_PLUS,
+                                    ContextAction::AddReaction { message: menu_message.id },
+                                ),
+                                ContextMenuItem::new(
+                                    "Copy text",
+                                    icons::LINK,
+                                    ContextAction::CopyMessageText { body: menu_message.body.clone() },
+                                ),
+                            ];
+                            if menu_is_self {
+                                items.push(ContextMenuItem::new(
+                                    "Edit message",
+                                    icons::PENCIL,
+                                    ContextAction::EditMessage { message: menu_message.clone() },
+                                ));
+                                items.push(
+                                    ContextMenuItem::new(
+                                        "Delete message",
+                                        icons::TRASH,
+                                        ContextAction::DeleteMessage { message: menu_message.id },
+                                    )
+                                    .destructive(),
+                                );
+                            }
+                            shell.open_context_menu(event, items, cx);
+                        }),
+                    )
                     .flex()
                     .gap(px(12.))
                     .px(px(16.))
@@ -1814,7 +1862,7 @@ impl Shell {
     /// the live room is Online; everyone else who has ever written a
     /// stored message shows under Offline. Bios (when replicated) ride
     /// along as tooltips.
-    fn render_member_panel(&mut self, profile: &Profile, _cx: &mut Context<Self>) -> Div {
+    fn render_member_panel(&mut self, profile: &Profile, cx: &mut Context<Self>) -> Div {
         let Screen::Server { id: server_id, .. } = self.screen else { return div() };
 
         let mut online: Vec<String> = self
@@ -1849,7 +1897,7 @@ impl Shell {
                 .child(label)
         };
         let mut row_index = 0u64;
-        let mut member_row = |name: String, is_online: bool, shell: &Self| {
+        let mut member_row = |name: String, is_online: bool, shell: &Self, cx: &mut Context<Self>| {
             let is_self = name == profile.name;
             let avatar = if is_self {
                 profile.avatar_path.clone()
@@ -1868,8 +1916,31 @@ impl Shell {
                 shell.peer_bios.get(&name).cloned()
             };
             row_index += 1;
+            let name_for_menu = name.clone();
             let row = div()
                 .id(SharedString::from(format!("member-{row_index}")))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |shell, event, _window, cx| {
+                        shell.open_context_menu(
+                            event,
+                            vec![
+                                ContextMenuItem::new(
+                                    "Mention",
+                                    icons::REPLY,
+                                    ContextAction::MentionUser { author: name_for_menu.clone() },
+                                ),
+                                ContextMenuItem::new(
+                                    "View profile",
+                                    icons::USER,
+                                    ContextAction::ViewProfile { author: name_for_menu.clone() },
+                                )
+                                .soon(),
+                            ],
+                            cx,
+                        );
+                    }),
+                )
                 .mx(px(6.))
                 .px(px(6.))
                 .py(px(3.))
@@ -1901,8 +1972,9 @@ impl Shell {
             }
         };
 
-        let online_rows: Vec<_> = online.iter().map(|name| member_row(name.clone(), true, self)).collect();
-        let offline_rows: Vec<_> = offline.iter().map(|name| member_row(name.clone(), false, self)).collect();
+        let online_rows: Vec<_> = online.iter().map(|name| member_row(name.clone(), true, self, cx)).collect();
+        let offline_rows: Vec<_> =
+            offline.iter().map(|name| member_row(name.clone(), false, self, cx)).collect();
 
         div()
             .w(px(196.))

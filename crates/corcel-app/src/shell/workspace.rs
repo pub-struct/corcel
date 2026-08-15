@@ -144,6 +144,34 @@ impl Shell {
                                 MouseButton::Left,
                                 cx.listener(move |shell, _, _window, cx| shell.open_server(id, cx)),
                             )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |shell, event, _window, cx| {
+                                    shell.open_context_menu(
+                                        event,
+                                        vec![
+                                            ContextMenuItem::new(
+                                                "Copy invite link",
+                                                icons::LINK,
+                                                ContextAction::CopyInvite { server: id },
+                                            ),
+                                            ContextMenuItem::new(
+                                                "Mark all as read",
+                                                icons::MESSAGE_SQUARE,
+                                                ContextAction::MarkAllRead { server: id },
+                                            ),
+                                            ContextMenuItem::new(
+                                                "Leave server",
+                                                icons::LOG_OUT,
+                                                ContextAction::LeaveServer { server: id },
+                                            )
+                                            .soon()
+                                            .destructive(),
+                                        ],
+                                        cx,
+                                    );
+                                }),
+                            )
                             .child(initial),
                     )
                     .children((mention_total > 0).then(|| {
