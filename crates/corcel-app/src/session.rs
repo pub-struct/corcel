@@ -105,9 +105,27 @@ pub async fn join(link: ServerLink, channel: ChannelId) -> anyhow::Result<CallSe
 /// connects: `pc` lets it publish more tracks later (e.g. [`start_screen_share`]),
 /// and `remote_video` streams decoded frames from whatever video track(s)
 /// the host forwards, for rendering.
+/// Events on a call's video channel. Every video feed — each remote
+/// track, plus each local self-preview — carries a process-unique id, so
+/// the stage can render feeds as separate tiles instead of the old
+/// single slot where camera and screen share overwrote each other.
+pub enum VideoEvent {
+    /// A decoded frame of the given feed.
+    Frame(u64, corcel_media::VideoFrame),
+    /// The feed ended (track closed / capture stopped) — remove its tile.
+    Closed(u64),
+}
+
+/// Allocates a feed id. Process-wide (not per call) so a feed id can
+/// never collide across a hang-up/rejoin race.
+fn next_video_feed() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct CallSession {
     pub pc: CallHandle,
-    pub remote_video: mpsc::Receiver<corcel_media::VideoFrame>,
+    pub remote_video: mpsc::Receiver<VideoEvent>,
     /// Sending `true` (or just dropping this) is the only signal every task
     /// [`attach_media`] spawned — statically there, and dynamically as new
     /// tracks arrive — shares to know when to stop. Nothing else ties their
@@ -140,7 +158,7 @@ pub struct CallSession {
     /// own self-preview frames to the very stage that renders remote video —
     /// without sharing, you'd be the only one in the call who can't see the
     /// screen you're sharing.
-    pub local_video: mpsc::Sender<corcel_media::VideoFrame>,
+    pub local_video: mpsc::Sender<VideoEvent>,
 }
 
 /// Wires this participant's connection up to real media (PROJECT.md decision
@@ -229,6 +247,7 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
                             continue;
                         }
                     };
+                    let feed = next_video_feed();
                     let video_tx = video_tx.clone();
                     let mut stop_rx = hang_up_rx.clone();
                     tokio::spawn(async move {
@@ -241,7 +260,7 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
                                 }
                                 frame = playback.frames.recv() => {
                                     let Some(frame) = frame else { break };
-                                    match video_tx.try_send(frame) {
+                                    match video_tx.try_send(VideoEvent::Frame(feed, frame)) {
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(_)) => {}
                                         Err(mpsc::error::TrySendError::Closed(_)) => break,
@@ -249,6 +268,10 @@ async fn attach_media(participant: Participant) -> anyhow::Result<CallSession> {
                                 }
                             }
                         }
+                        // Unlike frames (only the newest matters, drop on
+                        // full), the closure must arrive or the tile
+                        // freezes on screen — await capacity for it.
+                        let _ = video_tx.send(VideoEvent::Closed(feed)).await;
                     });
                 }
             }
@@ -305,11 +328,12 @@ impl CameraHandle {
 pub async fn start_camera(
     pc: CallHandle,
     device: &str,
-    preview: mpsc::Sender<corcel_media::VideoFrame>,
+    preview: mpsc::Sender<VideoEvent>,
 ) -> anyhow::Result<CameraHandle> {
     let mut capture = corcel_media::capture::camera(device)?;
     let outgoing = corcel_net::publish_video_track(&pc);
     let mut playback = corcel_media::VideoPlayback::new()?;
+    let feed = next_video_feed();
 
     let (stop_tx, mut stop_rx) = oneshot::channel();
     tokio::spawn(async move {
@@ -325,10 +349,13 @@ pub async fn start_camera(
                 }
                 frame = playback.frames.recv() => {
                     let Some(frame) = frame else { break };
-                    let _ = preview.try_send(frame);
+                    let _ = preview.try_send(VideoEvent::Frame(feed, frame));
                 }
             }
         }
+        // Reliable (awaited) so our own tile actually leaves the stage —
+        // see the remote-track loop for the same reasoning.
+        let _ = preview.send(VideoEvent::Closed(feed)).await;
         capture.close().await;
     });
 
@@ -350,12 +377,13 @@ pub async fn start_camera(
 /// the *encoded* stream, artifacts and all, which is the honest preview.
 pub async fn start_screen_share(
     pc: CallHandle,
-    preview: mpsc::Sender<corcel_media::VideoFrame>,
+    preview: mpsc::Sender<VideoEvent>,
     quality: corcel_media::ScreenShareQuality,
 ) -> anyhow::Result<ScreenShareHandle> {
     let mut capture = corcel_media::capture::screen(quality).await?;
     let outgoing = corcel_net::publish_video_track(&pc);
     let mut playback = corcel_media::VideoPlayback::new()?;
+    let feed = next_video_feed();
 
     let (stop_tx, mut stop_rx) = oneshot::channel();
     tokio::spawn(async move {
@@ -371,10 +399,11 @@ pub async fn start_screen_share(
                 }
                 frame = playback.frames.recv() => {
                     let Some(frame) = frame else { break };
-                    let _ = preview.try_send(frame);
+                    let _ = preview.try_send(VideoEvent::Frame(feed, frame));
                 }
             }
         }
+        let _ = preview.send(VideoEvent::Closed(feed)).await;
         // Closes the portal ScreenCast session (a D-Bus round trip `Drop`
         // can't do on its own — see `Capture::close`) so GNOME's "you are
         // sharing your screen" indicator actually clears, instead of

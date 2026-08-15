@@ -22,7 +22,7 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, Background, ClipboardItem, Context, Div, Entity, Focusable, FontWeight,
     ImageSource, KeyDownEvent, KeyUpEvent, MouseButton, MouseUpEvent, ObjectFit, PathPromptOptions, Render,
     RenderImage, Rgba, ScrollHandle, SharedString, Stateful, Transformation, Window, deferred, div, ease_out_quint,
-    img, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
+    img, linear_color_stop, linear_gradient, prelude::*, px, radians, relative, rgba,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -79,14 +79,13 @@ enum CameraState {
 /// [`Shell`] tree (rail, channel list, member list, ...) once per frame,
 /// which is what happened when `remote_frame` lived directly on the shell.
 ///
-/// The frame is a single slot fed by whichever video track last produced a
-/// frame (see [`CallSession::remote_video`]) — fine while at most one video
-/// track is ever in flight, but once camera and screen share can both be
-/// active (from the same peer or different ones) they'll overwrite each
-/// other with no way to tell them apart. Not fixed here; revisit if/when
-/// that's actually needed.
+/// Holds one tile per live video feed (each remote track and each local
+/// self-preview has its own feed id — see [`session::VideoEvent`]), laid
+/// out as a grid: one feed fills the stage, two split it, three or four
+/// quarter it. Insertion order is arrival order, so tiles don't reshuffle
+/// mid-call.
 struct VideoSurface {
-    frame: Option<Arc<RenderImage>>,
+    frames: Vec<(u64, Arc<RenderImage>)>,
     /// Profile bits for the audio-only placeholder tile, copied in at
     /// creation so this view renders without reaching back into the shell.
     name: SharedString,
@@ -99,14 +98,58 @@ struct VideoSurface {
     speaking: bool,
 }
 
+impl VideoSurface {
+    /// Replaces (or adds) a feed's frame, returning the texture that must
+    /// be dropped by the caller via `cx.drop_image` — `RenderImage`s are
+    /// never evicted from the sprite atlas on their own.
+    fn set_frame(&mut self, feed: u64, image: Arc<RenderImage>) -> Option<Arc<RenderImage>> {
+        match self.frames.iter_mut().find(|(id, _)| *id == feed) {
+            Some((_, slot)) => Some(std::mem::replace(slot, image)),
+            None => {
+                self.frames.push((feed, image));
+                None
+            }
+        }
+    }
+
+    fn remove_feed(&mut self, feed: u64) -> Option<Arc<RenderImage>> {
+        let index = self.frames.iter().position(|(id, _)| *id == feed)?;
+        Some(self.frames.remove(index).1)
+    }
+}
+
 impl Render for VideoSurface {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match self.frame.clone() {
-            Some(frame) => div()
-                .size_full()
-                .child(img(ImageSource::Render(frame)).size_full().object_fit(ObjectFit::Contain))
-                .into_any_element(),
-            None => div()
+        match self.frames.len() {
+            count if count > 0 => {
+                // 1 feed fills the stage; 2 sit side by side; 3-4 quarter
+                // it. (More than 4 video feeds at friends scale means
+                // someone is showing off; they wrap into the same grid.)
+                let (tile_w, tile_h) = match count {
+                    1 => (1.0, 1.0),
+                    2 => (0.5, 1.0),
+                    _ => (0.5, 0.5),
+                };
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_center()
+                    .children(self.frames.iter().map(|(_, frame)| {
+                        div()
+                            .w(relative(tile_w))
+                            .h(relative(tile_h))
+                            .p(px(2.))
+                            .child(
+                                img(ImageSource::Render(frame.clone()))
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                    }))
+                    .into_any_element()
+            }
+            _ => div()
                 .size_full()
                 .flex()
                 .items_center()
@@ -168,7 +211,7 @@ struct ConnectedCall {
     /// [`session::start_screen_share`]/[`session::start_camera`] so the
     /// sharer's own stream shows up on their own stage too (see
     /// [`session::CallSession::local_video`]).
-    local_video: mpsc::Sender<corcel_media::VideoFrame>,
+    local_video: mpsc::Sender<session::VideoEvent>,
 }
 
 /// Stops a connected call's background media tasks (mic upload, incoming
@@ -181,13 +224,12 @@ fn hang_up(call: &ConnectedCall) {
     call.pc.close();
 }
 
-/// Drops the stage's current frame (and its GPU texture) so stopping your
-/// own share/camera doesn't leave the last frame frozen on screen looking
-/// like you're still sharing. If someone else is still streaming video,
-/// their next frame repopulates the stage within a frame interval.
+/// Drops every stage tile (and its GPU texture). The per-feed `Closed`
+/// event normally removes tiles one by one; this is the hang-up sweep so
+/// leaving a call can't leak the last frames' textures.
 fn clear_stage(surface: &Entity<VideoSurface>, cx: &mut gpui::App) {
     surface.update(cx, |surface, cx| {
-        if let Some(old) = surface.frame.take() {
+        for (_, old) in surface.frames.drain(..) {
             cx.drop_image(old, None);
         }
         cx.notify();

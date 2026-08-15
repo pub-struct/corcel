@@ -81,7 +81,7 @@ impl Shell {
             let surface = this.update(cx, |shell, cx| {
                 let profile = shell.profile.as_ref();
                 let surface = cx.new(|_| VideoSurface {
-                    frame: None,
+                    frames: Vec::new(),
                     name: profile.map(|p| p.name.clone()).unwrap_or_default().into(),
                     avatar: profile.and_then(|p| p.avatar_path.clone()),
                     initial: profile.map(|p| p.initial()).unwrap_or_else(|| "?".to_string()).into(),
@@ -126,23 +126,34 @@ impl Shell {
             });
             let Ok(Some(surface)) = surface else { return };
 
-            // Pump decoded frames into the video surface only — the rest of
-            // the shell doesn't re-render for them. Dropping the *previous*
+            // Pump video events into the surface only — the rest of the
+            // shell doesn't re-render for them. Dropping the *previous*
             // frame's texture explicitly matters: `RenderImage`s are keyed
             // into GPUI's sprite atlas by id and are never evicted on their
             // own, so without this every frame of a call permanently leaks
             // a full-resolution GPU texture.
-            while let Some(frame) = remote_video.recv().await {
-                let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.data) else {
-                    continue;
-                };
-                let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-                let updated = surface.update(cx, |surface, cx| {
-                    if let Some(old) = surface.frame.replace(image) {
-                        cx.drop_image(old, None);
+            while let Some(event) = remote_video.recv().await {
+                let updated = match event {
+                    session::VideoEvent::Frame(feed, frame) => {
+                        let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.data)
+                        else {
+                            continue;
+                        };
+                        let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+                        surface.update(cx, |surface, cx| {
+                            if let Some(old) = surface.set_frame(feed, image) {
+                                cx.drop_image(old, None);
+                            }
+                            cx.notify();
+                        })
                     }
-                    cx.notify();
-                });
+                    session::VideoEvent::Closed(feed) => surface.update(cx, |surface, cx| {
+                        if let Some(old) = surface.remove_feed(feed) {
+                            cx.drop_image(old, None);
+                        }
+                        cx.notify();
+                    }),
+                };
                 if updated.is_err() {
                     break;
                 }
@@ -155,6 +166,7 @@ impl Shell {
         let Some(call) = self.call.take() else { return };
         if let ChannelStatus::Connected(connected) = &call.status {
             hang_up(connected);
+            clear_stage(&connected.remote_surface, cx);
             // The speaking watcher dies with the call and can't say this
             // for us — clear our ring for everyone explicitly rather than
             // leaving it to their expiry timer, and vacate our roster row.
@@ -398,9 +410,10 @@ impl Shell {
     pub(super) fn stop_sharing_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(call) = self.connected_call_mut() {
             if let SharingState::Active(handle) = std::mem::replace(&mut call.sharing, SharingState::Idle) {
+                // Our tile leaves the stage via the capture task's
+                // `VideoEvent::Closed` — no blanket stage clear, everyone
+                // else's tiles stay put.
                 handle.stop();
-                let surface = call.remote_surface.clone();
-                clear_stage(&surface, cx);
                 cx.notify();
             }
         }
@@ -449,9 +462,9 @@ impl Shell {
     pub(super) fn stop_camera_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(call) = self.connected_call_mut() {
             if let CameraState::Active(handle) = std::mem::replace(&mut call.camera, CameraState::Idle) {
+                // Same as stop_sharing_clicked: the feed's `Closed` event
+                // removes just our tile.
                 handle.stop();
-                let surface = call.remote_surface.clone();
-                clear_stage(&surface, cx);
                 cx.notify();
             }
         }

@@ -293,14 +293,6 @@ impl Shell {
     /// set a banner, click the avatar to set a photo, type your name into
     /// the card in display type. The form *is* the artifact.
     pub(super) fn render_profile_setup(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let name = self.profile_form.name_input.read(cx).content.clone();
-        let initial = name
-            .trim()
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".to_string());
-
         // The brand half. Each manifesto line holds invisible for a beat,
         // then fades in — a quiet staggered entrance instead of a wall of
         // text landing all at once.

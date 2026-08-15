@@ -1339,7 +1339,7 @@ impl Shell {
     /// the live room is Online; everyone else who has ever written a
     /// stored message shows under Offline. Bios (when replicated) ride
     /// along as tooltips.
-    fn render_member_panel(&mut self, profile: &Profile, cx: &mut Context<Self>) -> Div {
+    fn render_member_panel(&mut self, profile: &Profile, _cx: &mut Context<Self>) -> Div {
         let Screen::Server { id: server_id, .. } = self.screen else { return div() };
 
         let mut online: Vec<String> = self
