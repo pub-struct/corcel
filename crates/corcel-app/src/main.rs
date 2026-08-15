@@ -16,11 +16,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt, App, Application, Bounds, ClipboardItem, Context, Div, Entity, Focusable, FontWeight,
+    Animation, AnimationExt, AnyElement, App, Application, Background, Bounds, ClipboardItem, Context, Div, Entity,
+    Focusable, FontWeight,
     ImageSource, KeyDownEvent, KeyUpEvent, MouseButton, MouseUpEvent, ObjectFit, PathPromptOptions, Render,
     RenderImage, Rgba,
     ScrollHandle, SharedString, Stateful, TitlebarOptions, Transformation, Window, WindowBounds, WindowOptions,
-    deferred, div, img, prelude::*, px, radians, size,
+    deferred, div, ease_out_quint, img, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba, size,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -289,6 +290,19 @@ enum Screen {
     Server { id: Uuid, view: ServerView },
 }
 
+/// Which step of the add-server journey is on screen. The same three-step
+/// flow backs two surfaces: the first-run fullscreen "arrival" (no servers
+/// yet) and the rail-"+" modal — so the polished path is the only path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddServerStage {
+    /// The fork: create your own vs join a friend's.
+    Choice,
+    /// Naming a server this machine will host.
+    Create,
+    /// Pasting an invite link.
+    Join,
+}
+
 /// State for the one-time first-run profile form (see [`Shell::profile`] —
 /// while that's `None`, [`Shell::render`] shows this instead of `screen`).
 struct ProfileForm {
@@ -302,8 +316,8 @@ struct ProfileForm {
 impl ProfileForm {
     fn new(cx: &mut Context<Shell>) -> Self {
         Self {
-            name_input: cx.new(|cx| TextInput::new("Your name", cx)),
-            bio_input: cx.new(|cx| TextInput::new("Add a short bio…", cx)),
+            name_input: cx.new(|cx| TextInput::new_hero("Your name", cx)),
+            bio_input: cx.new(|cx| TextInput::new("A line about you (optional)", cx)),
             avatar_path: None,
             banner_path: None,
             error: None,
@@ -377,6 +391,12 @@ struct Shell {
     /// lands (see [`Shell::reload_reactions`]).
     chat_reactions: HashMap<Uuid, Vec<(String, Vec<String>)>>,
     add_server_open: bool,
+    /// Where the add-server flow currently stands (see [`AddServerStage`]).
+    /// Reset to `Choice` whenever the flow is (re)entered.
+    add_server_stage: AddServerStage,
+    /// `true` from clicking "Create server" until the async host attempt
+    /// resolves — renders the CTA dimmed/inert so the click visibly took.
+    hosting_pending: bool,
     /// Briefly `true` after "Copy Invite Link" so the button itself can
     /// confirm the copy happened — clipboard writes are otherwise invisible.
     link_copied: bool,
@@ -405,8 +425,8 @@ impl Shell {
             chat_messages: Vec::new(),
             chat_scroll: ScrollHandle::new(),
             message_input: cx.new(|cx| TextInput::new("Send a message…", cx)),
-            server_name_input: cx.new(|cx| TextInput::new("My Server", cx)),
-            join_link_input: cx.new(|cx| TextInput::new("Paste an invite link...", cx)),
+            server_name_input: cx.new(|cx| TextInput::new_hero("The Clubhouse", cx)),
+            join_link_input: cx.new(|cx| TextInput::new("corcel1…", cx)),
             unread: HashMap::new(),
             switcher_open: false,
             switcher_input: cx.new(|cx| TextInput::new("Where would you like to go?", cx)),
@@ -419,6 +439,8 @@ impl Shell {
             reacting_to: None,
             chat_reactions: HashMap::new(),
             add_server_open: false,
+            add_server_stage: AddServerStage::Choice,
+            hosting_pending: false,
             link_copied: false,
             error,
         };
@@ -538,6 +560,10 @@ impl Shell {
     }
 
     fn profile_continue_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_profile(cx);
+    }
+
+    fn submit_profile(&mut self, cx: &mut Context<Self>) {
         let name = self.profile_form.name_input.read(cx).content.trim().to_string();
         if name.is_empty() {
             self.profile_form.error = Some("A name is required.".to_string());
@@ -565,6 +591,7 @@ impl Shell {
 
     fn open_add_server_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.add_server_open = true;
+        self.add_server_stage = AddServerStage::Choice;
         self.error = None;
         cx.notify();
     }
@@ -574,15 +601,38 @@ impl Shell {
         cx.notify();
     }
 
+    /// Moves the add-server flow to `stage`, landing focus in that stage's
+    /// input so the user can just start typing.
+    fn arrival_go(&mut self, stage: AddServerStage, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_server_stage = stage;
+        self.error = None;
+        match stage {
+            AddServerStage::Create => window.focus(&self.server_name_input.focus_handle(cx)),
+            AddServerStage::Join => window.focus(&self.join_link_input.focus_handle(cx)),
+            AddServerStage::Choice => {}
+        }
+        cx.notify();
+    }
+
     fn host_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_host(cx);
+    }
+
+    fn submit_host(&mut self, cx: &mut Context<Self>) {
+        if self.hosting_pending {
+            return;
+        }
         let name = self.server_name_input.read(cx).content.to_string();
         let name = if name.trim().is_empty() { "My Server".to_string() } else { name };
         self.error = None;
+        self.hosting_pending = true;
+        cx.notify();
 
         let rx = runtime::spawn_and_send(session::host(name));
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |shell, cx| {
+                shell.hosting_pending = false;
                 match result {
                     Ok(Ok((link, identity))) => {
                         let server = SavedServer { link, is_host: true, identity: Some(identity) };
@@ -594,6 +644,7 @@ impl Shell {
                         let id = server.link.id;
                         shell.servers.push(server);
                         shell.add_server_open = false;
+                        shell.add_server_stage = AddServerStage::Choice;
                         shell.server_name_input.update(cx, |input, cx| input.clear(cx));
                         shell.connect_chat(id, cx);
                         shell.open_server(id, cx);
@@ -608,6 +659,10 @@ impl Shell {
     }
 
     fn join_clicked(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_join(cx);
+    }
+
+    fn submit_join(&mut self, cx: &mut Context<Self>) {
         let text = self.join_link_input.read(cx).content.to_string();
         match ServerLink::decode(text.trim()) {
             Ok(link) => {
@@ -631,6 +686,7 @@ impl Shell {
                     self.servers.push(server);
                 }
                 self.add_server_open = false;
+                self.add_server_stage = AddServerStage::Choice;
                 self.error = None;
                 self.join_link_input.update(cx, |input, cx| input.clear(cx));
                 self.connect_chat(id, cx);
@@ -683,6 +739,9 @@ impl Shell {
         }
         self.servers.retain(|server| server.link.id != id);
         self.screen = Screen::Home;
+        // If that was the last server, Home is the fullscreen arrival flow
+        // again — start it back at the fork.
+        self.add_server_stage = AddServerStage::Choice;
         cx.notify();
     }
 
@@ -870,6 +929,32 @@ impl Shell {
             return;
         }
         if !self.switcher_open {
+            // Onboarding keys: Enter submits the visible step, Escape backs
+            // out one stage. These surfaces sit above (or instead of) the
+            // chat UI, so returning early here can't eat a composer key.
+            if self.profile.is_none() {
+                if key == "enter" {
+                    self.submit_profile(cx);
+                }
+                return;
+            }
+            let arrival_visible = self.add_server_open
+                || (self.servers.is_empty() && matches!(self.screen, Screen::Home));
+            if arrival_visible {
+                match (key, self.add_server_stage) {
+                    ("enter", AddServerStage::Create) => self.submit_host(cx),
+                    ("enter", AddServerStage::Join) => self.submit_join(cx),
+                    ("escape", AddServerStage::Create | AddServerStage::Join) => {
+                        self.arrival_go(AddServerStage::Choice, window, cx);
+                    }
+                    ("escape", AddServerStage::Choice) if self.add_server_open => {
+                        self.add_server_open = false;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             // Push-to-talk: Space held (and not typing anywhere) opens the
             // mic. Key auto-repeat re-fires this, which `set_muted`'s
             // no-change guard absorbs.
@@ -1841,6 +1926,11 @@ impl Shell {
     /// "First run — set up your profile" frame: a dashed banner picker with
     /// an avatar picker overlapping its bottom edge, then Name (required)
     /// and Bio (optional).
+    /// The first-run identity screen. Split-bleed: a gradient brand panel
+    /// stating what corcel is while you type, and — instead of a labeled
+    /// form — the actual profile card, edited directly: click the banner to
+    /// set a banner, click the avatar to set a photo, type your name into
+    /// the card in display type. The form *is* the artifact.
     fn render_profile_setup(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.profile_form.name_input.read(cx).content.clone();
         let initial = name
@@ -1850,150 +1940,463 @@ impl Shell {
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "?".to_string());
 
-        let banner = div()
-            .h(px(84.))
-            .rounded_lg() // --radius-lg (10px, nearest preset)
-            .overflow_hidden()
-            .bg(theme::wash())
-            .border_1()
-            .border_dashed()
-            .border_color(theme::input_border())
-            .cursor_pointer()
-            .hover(|style| style.border_color(theme::ring()))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::pick_banner_clicked))
-            .child(match &self.profile_form.banner_path {
-                Some(path) => {
-                    img(ImageSource::from(path.clone())).size_full().object_fit(ObjectFit::Cover).into_any_element()
-                }
-                None => div()
-                    .size_full()
+        // The brand half. Each manifesto line holds invisible for a beat,
+        // then fades in — a quiet staggered entrance instead of a wall of
+        // text landing all at once.
+        let manifesto: [(&'static str, &'static str); 3] = [
+            (icons::USERS, "Servers live on your machines — no company in the middle."),
+            (icons::LINK, "One link is the whole invite. Share it anywhere."),
+            (icons::MIC, "Voice, video, and chat that stay between friends."),
+        ];
+        let brand = div()
+            .w(px(360.))
+            .flex_none()
+            .h_full()
+            .bg(linear_gradient(
+                160.,
+                linear_color_stop(rgba(0x5865f2ff), 0.),
+                linear_color_stop(rgba(0x201a52ff), 1.),
+            ))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(44.))
+            .p(px(44.))
+            .child(
+                div()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.))
-                    .text_color(theme::faint_foreground())
-                    .child("Add a banner (optional)")
-                    .into_any_element(),
-            });
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .text_size(px(42.))
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_color(rgba(0xffffffff))
+                            .child("corcel"),
+                    )
+                    .child(div().text_size(px(15.)).text_color(rgba(0xffffffb8)).child("A place for your people.")),
+            )
+            .child(div().flex().flex_col().gap(px(18.)).children(manifesto.into_iter().enumerate().map(
+                |(index, (icon_path, line))| {
+                    manifesto_row(icon_path, line).with_animations(
+                        ("identity-manifesto", index as u64),
+                        vec![
+                            Animation::new(Duration::from_millis(160 + 150 * index as u64)),
+                            Animation::new(Duration::from_millis(460)).with_easing(ease_out_quint()),
+                        ],
+                        |row, phase, delta| if phase == 0 { row.opacity(0.) } else { row.opacity(delta) },
+                    )
+                },
+            )));
 
-        let avatar_picker = div()
-            .id("avatar-picker")
-            .ml(px(20.))
-            .mt(px(-32.))
-            .cursor_pointer()
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::pick_avatar_clicked))
-            .child(theme::avatar(self.profile_form.avatar_path.clone(), initial, px(64.)));
+        let banner: AnyElement = match &self.profile_form.banner_path {
+            Some(path) => {
+                img(ImageSource::from(path.clone())).size_full().object_fit(ObjectFit::Cover).into_any_element()
+            }
+            None => div()
+                .size_full()
+                .bg(linear_gradient(
+                    120.,
+                    linear_color_stop(rgba(0x5865f2ff), 0.),
+                    linear_color_stop(rgba(0x00a8fcff), 1.),
+                ))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded_full()
+                        .bg(rgba(0x00000038))
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgba(0xffffffd8))
+                        .child("Click to add a banner"),
+                )
+                .into_any_element(),
+        };
+
+        // The pencil badge marks the avatar as editable even before hover.
+        let avatar_badge = div()
+            .absolute()
+            .bottom(px(2.))
+            .right(px(2.))
+            .size(px(26.))
+            .rounded_full()
+            .bg(theme::wash_strong())
+            .border_2()
+            .border_color(theme::card())
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(theme::icon(icons::PENCIL, px(12.)).text_color(theme::muted_foreground()));
+
+        let card = div()
+            .w(px(340.))
+            .rounded_xl()
+            .overflow_hidden()
+            .bg(theme::card())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(
+                div()
+                    .id("banner-picker")
+                    .h(px(110.))
+                    .w_full()
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.9))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::pick_banner_clicked))
+                    .child(banner),
+            )
+            .child(
+                div().px(px(20.)).mt(px(-40.)).child(
+                    div()
+                        .id("avatar-picker")
+                        .relative()
+                        .w(px(88.))
+                        .cursor_pointer()
+                        .active(|style| style.opacity(0.9))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::pick_avatar_clicked))
+                        .child(
+                            div()
+                                .rounded_full()
+                                .border_4()
+                                .border_color(theme::card())
+                                .child(theme::avatar(self.profile_form.avatar_path.clone(), initial, px(80.))),
+                        )
+                        .child(avatar_badge),
+                ),
+            )
+            .child(
+                div()
+                    .px(px(20.))
+                    .pt(px(6.))
+                    .pb(px(20.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(self.profile_form.name_input.clone())
+                    .child(self.profile_form.bio_input.clone()),
+            );
 
         let error = self.profile_form.error.clone().map(|message| {
             div().text_size(px(12.5)).text_color(theme::destructive_foreground()).child(message)
         });
 
-        div()
+        let form = div()
             .flex()
             .flex_col()
-            .gap_4()
-            .w(px(320.))
-            .child(div().text_size(px(19.)).font_weight(FontWeight::BOLD).child("corcel"))
+            .gap(px(22.))
+            .w(px(340.))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).child("Set up your profile"))
+                    .gap(px(6.))
+                    .child(div().text_size(px(28.)).font_weight(FontWeight::BOLD).child("First — you."))
                     .child(
                         div()
                             .text_size(px(13.5))
                             .text_color(theme::muted_foreground())
-                            .child("This is how people in your servers will see you. Only a name is required."),
+                            .child("This card is how friends see you. Only the name is required."),
                     ),
             )
-            .child(div().flex().flex_col().child(banner).child(avatar_picker))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .mt(px(-16.))
-                    .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(theme::muted_foreground()).child("Name"))
-                    .child(self.profile_form.name_input.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::muted_foreground())
-                            .child("Bio (optional)"),
-                    )
-                    .child(self.profile_form.bio_input.clone()),
-            )
+            .child(card)
             .children(error)
             .child(
-                theme::button(ButtonVariant::Primary, "Continue")
+                theme::button(ButtonVariant::Primary, "That's me →")
+                    .w_full()
+                    .flex()
+                    .justify_center()
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::profile_continue_clicked)),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .bg(theme::background())
+            .text_color(theme::foreground())
+            .child(brand)
+            .child(
+                div().flex_1().h_full().flex().items_center().justify_center().p(px(24.)).child(
+                    form.with_animation(
+                        "identity-form",
+                        Animation::new(Duration::from_millis(380)).with_easing(ease_out_quint()),
+                        |form, delta| form.opacity(delta),
+                    ),
+                ),
             )
     }
 
-    /// The empty Home screen — no servers yet, just a centered "+" that
-    /// opens [`Self::render_add_server_modal`].
-    fn render_home_empty_state(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_3()
-            .child(
-                div()
-                    .id("add-server")
-                    .group("home-add")
+    /// The body of the current [`AddServerStage`] — shared verbatim between
+    /// the first-run fullscreen arrival and the rail-"+" modal, so the
+    /// polished path is the only path.
+    fn render_arrival_stage(&mut self, cx: &mut Context<Self>) -> Div {
+        match self.add_server_stage {
+            AddServerStage::Choice => {
+                let create_card = arrival_choice_card(
+                    "arrival-create",
+                    linear_gradient(
+                        135.,
+                        linear_color_stop(rgba(0x5865f2ff), 0.),
+                        linear_color_stop(rgba(0x2b2168ff), 1.),
+                    ),
+                    icons::PLUS,
+                    "Create your own",
+                    "Host a server on this machine — a #general to talk in, a voice room to hang in, an invite link to hand out.",
+                    "Start fresh →",
+                    rgba(0x949cf7ff),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _: &MouseUpEvent, window, cx| {
+                        shell.arrival_go(AddServerStage::Create, window, cx)
+                    }),
+                );
+                let join_card = arrival_choice_card(
+                    "arrival-join",
+                    linear_gradient(
+                        135.,
+                        linear_color_stop(rgba(0x23a55aff), 0.),
+                        linear_color_stop(rgba(0x00a8fcff), 1.),
+                    ),
+                    icons::LINK,
+                    "Join your friends",
+                    "Someone sent you an invite link? Paste it and you're standing in their server a second later.",
+                    "I have an invite →",
+                    rgba(0x3dc06cff),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _: &MouseUpEvent, window, cx| {
+                        shell.arrival_go(AddServerStage::Join, window, cx)
+                    }),
+                );
+                div().flex().gap(px(18.)).child(create_card).child(join_card)
+            }
+            AddServerStage::Create => {
+                let typed = self.server_name_input.read(cx).content.trim().to_string();
+                let display: SharedString =
+                    if typed.is_empty() { "The Clubhouse".into() } else { typed.clone().into() };
+                let initial = display
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+
+                // The live preview: the exact rail bubble and name this
+                // server will get, updating per keystroke — name it and
+                // *watch* it become real.
+                let preview = div()
+                    .rounded_lg()
+                    .bg(theme::rail())
+                    .border_1()
+                    .border_color(theme::border())
+                    .p(px(14.))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .size(px(56.))
-                    .rounded_full()
-                    .border_1()
-                    .border_dashed()
-                    .border_color(theme::input_border())
-                    .cursor_pointer()
-                    .hover(|style| style.border_color(theme::success()).bg(theme::success()))
-                    .active(|style| style.opacity(0.85))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::open_add_server_clicked))
+                    .gap(px(14.))
                     .child(
-                        theme::icon(icons::PLUS, px(22.))
-                            .text_color(theme::success())
-                            .group_hover("home-add", |style| style.text_color(theme::primary_foreground())),
-                    ),
+                        div()
+                            .size(px(48.))
+                            .rounded(px(16.))
+                            .flex_none()
+                            .bg(theme::primary())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::primary_foreground())
+                            .child(initial),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(14.5)).font_weight(FontWeight::SEMIBOLD).child(display))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme::muted_foreground())
+                                    .child("# general · a voice room · invite link ready to share"),
+                            ),
+                    );
+
+                let cta = if self.hosting_pending {
+                    theme::button(ButtonVariant::Primary, "Creating…").opacity(0.6)
+                } else {
+                    theme::button(ButtonVariant::Primary, "Create server →")
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::host_clicked))
+                };
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(18.))
+                    .w(px(430.))
+                    .child(self.server_name_input.clone())
+                    .child(preview)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(self.arrival_back_link(cx))
+                            .child(cta),
+                    )
+            }
+            AddServerStage::Join => div()
+                .flex()
+                .flex_col()
+                .gap(px(18.))
+                .w(px(430.))
+                .child(self.join_link_input.clone())
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme::faint_foreground())
+                        .child("Ask your friend to hit \"Copy Invite Link\" in their server — the link starts with corcel1."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(self.arrival_back_link(cx))
+                        .child(
+                            theme::button(ButtonVariant::Primary, "Join server →")
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::join_clicked)),
+                        ),
+                ),
+        }
+    }
+
+    /// The "← Back" step-out shared by the Create and Join stages.
+    fn arrival_back_link(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("arrival-back")
+            .px(px(10.))
+            .py(px(6.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(13.))
+            .text_color(theme::muted_foreground())
+            .hover(|style| style.bg(theme::wash()).text_color(theme::foreground()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|shell, _: &MouseUpEvent, window, cx| {
+                    shell.arrival_go(AddServerStage::Choice, window, cx)
+                }),
+            )
+            .child("← Back")
+    }
+
+    /// The first-run "arrival": no servers yet, so the whole window becomes
+    /// the add-server flow — a fork between creating and joining, then one
+    /// focused question per branch. Each stage cross-fades in; Enter
+    /// submits, Escape backs out (see [`Self::root_key_down`]).
+    fn render_arrival(&mut self, cx: &mut Context<Self>) -> Div {
+        let (headline, sub) = match self.add_server_stage {
+            AddServerStage::Choice => {
+                ("Now — a place to meet.", "Host your own in seconds, or walk into a friend's.")
+            }
+            AddServerStage::Create => {
+                ("Name your server.", "It runs from this machine; friends connect straight to you.")
+            }
+            AddServerStage::Join => ("Got an invite?", "Paste the whole link — nothing else needed."),
+        };
+        let stage_index = match self.add_server_stage {
+            AddServerStage::Choice => 0u64,
+            AddServerStage::Create => 1,
+            AddServerStage::Join => 2,
+        };
+        let error = self.error.clone().map(|message| {
+            div().text_size(px(12.5)).text_color(theme::destructive_foreground()).child(message)
+        });
+
+        div()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(theme::background())
+            .text_color(theme::foreground())
+            // A soft brand glow bleeding from the top edge, so even the
+            // empty state has some light in it.
+            .child(
+                div().absolute().top_0().left_0().w_full().h(px(320.)).bg(linear_gradient(
+                    180.,
+                    linear_color_stop(rgba(0x5865f236), 0.),
+                    linear_color_stop(rgba(0x5865f200), 1.),
+                )),
             )
             .child(
                 div()
-                    .text_size(px(13.))
-                    .text_color(theme::muted_foreground())
-                    .child("No servers yet — add one to get started"),
+                    .absolute()
+                    .top(px(26.))
+                    .left(px(32.))
+                    .text_size(px(17.))
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .child("corcel"),
+            )
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(28.))
+                    .p(px(24.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().text_size(px(28.)).font_weight(FontWeight::BOLD).child(headline))
+                            .child(div().text_size(px(13.5)).text_color(theme::muted_foreground()).child(sub)),
+                    )
+                    .child(self.render_arrival_stage(cx).with_animation(
+                        ("arrival-stage", stage_index),
+                        Animation::new(Duration::from_millis(280)).with_easing(ease_out_quint()),
+                        |stage, delta| stage.opacity(delta),
+                    ))
+                    .children(error),
             )
     }
 
-    /// The "Add a Server" modal: a dimmed backdrop behind a popover card
-    /// holding Host/Join fields. Dismissed by the "×", or by releasing the
-    /// mouse outside the card (same `on_mouse_up_out` trick [`TextInput`]
-    /// uses to end a drag started inside it).
+    /// The "Add a Server" modal for users who already have servers: the
+    /// same staged arrival flow (see [`Self::render_arrival_stage`]) on a
+    /// popover card. Dismissed by the "×", Escape, or releasing the mouse
+    /// outside the card (same `on_mouse_up_out` trick [`TextInput`] uses to
+    /// end a drag started inside it).
     fn render_add_server_modal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let backdrop = div().size_full().absolute().top_0().left_0().bg(theme::scrim());
 
+        let title = match self.add_server_stage {
+            AddServerStage::Choice => "Where next?",
+            AddServerStage::Create => "Name your server",
+            AddServerStage::Join => "Paste your invite",
+        };
+        let stage_index = match self.add_server_stage {
+            AddServerStage::Choice => 0u64,
+            AddServerStage::Create => 1,
+            AddServerStage::Join => 2,
+        };
         let error = self.error.clone().map(|message| {
             div().text_size(px(12.)).text_color(theme::destructive_foreground()).child(message)
         });
 
         let card = div()
             .id("add-server-card")
-            .w(px(300.))
             .flex()
             .flex_col()
-            .gap_4()
-            .p(px(20.))
+            .gap(px(18.))
+            .p(px(24.))
             .bg(theme::popover())
             .border_1()
             .border_color(theme::border())
@@ -2005,59 +2408,18 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child("Add a Server"))
+                    .gap(px(24.))
+                    .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child(title))
                     .child(
                         theme::icon_button("close-add-server", icons::X, "Close")
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::close_add_server_clicked)),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::muted_foreground())
-                            .child("Host a new server"),
-                    )
-                    .child(self.server_name_input.clone())
-                    .child(
-                        theme::button(ButtonVariant::Primary, "Host Server")
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::host_clicked)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(10.))
-                    .text_color(theme::faint_foreground())
-                    .child(div().flex_1().h(px(1.)).bg(theme::border()))
-                    .child("or")
-                    .child(div().flex_1().h(px(1.)).bg(theme::border())),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::muted_foreground())
-                            .child("Join with an invite"),
-                    )
-                    .child(self.join_link_input.clone())
-                    .child(
-                        theme::button(ButtonVariant::Secondary, "Join Server")
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::join_clicked)),
-                    ),
-            )
+            .child(self.render_arrival_stage(cx).with_animation(
+                ("add-server-stage", stage_index),
+                Animation::new(Duration::from_millis(280)).with_easing(ease_out_quint()),
+                |stage, delta| stage.opacity(delta),
+            ))
             .children(error);
 
         div()
@@ -3843,6 +4205,83 @@ fn stage_tile(
         .child(div().text_size(px(12.5)).text_color(theme::muted_foreground()).child(caption.into()))
 }
 
+/// One line of the identity screen's brand-panel manifesto: an icon chip
+/// over the gradient plus a short claim about what corcel is.
+fn manifesto_row(icon_path: &'static str, line: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .child(
+            div()
+                .size(px(38.))
+                .rounded_lg()
+                .flex_none()
+                .bg(rgba(0xffffff24))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(theme::icon(icon_path, px(18.)).text_color(rgba(0xffffffee))),
+        )
+        .child(div().text_size(px(13.5)).text_color(rgba(0xffffffcc)).child(line))
+}
+
+/// One of the two big illustrated cards at the arrival fork (create vs.
+/// join): a gradient "art" header with a badge icon, then title, copy, and
+/// an accent-colored call-to-action line. The whole card is the click
+/// target — callers attach `.on_mouse_up(...)`.
+fn arrival_choice_card(
+    id: &'static str,
+    art: Background,
+    icon_path: &'static str,
+    title: &'static str,
+    copy: &'static str,
+    cta: &'static str,
+    accent: Rgba,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(264.))
+        .rounded_xl()
+        .overflow_hidden()
+        .bg(theme::card())
+        .border_1()
+        .border_color(theme::border())
+        .cursor_pointer()
+        .hover(|style| style.border_color(theme::ring()).bg(theme::wash()))
+        .active(|style| style.opacity(0.92))
+        .child(
+            div().h(px(112.)).w_full().bg(art).flex().items_center().justify_center().child(
+                div()
+                    .size(px(52.))
+                    .rounded_full()
+                    .bg(rgba(0xffffff2b))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(theme::icon(icon_path, px(24.)).text_color(rgba(0xffffffff))),
+            ),
+        )
+        .child(
+            div()
+                .p(px(18.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().text_size(px(15.5)).font_weight(FontWeight::BOLD).child(title))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .line_height(px(18.))
+                        .text_color(theme::muted_foreground())
+                        .child(copy),
+                )
+                .child(
+                    div().mt(px(4.)).text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(accent).child(cta),
+                ),
+        )
+}
+
 /// A message's send time in the reader's local timezone — "Today at HH:MM"
 /// for today, a full date otherwise. The author's clock stamped it (see
 /// [`chat::ChatMessage::sent_at`]); at friends scale that's plenty.
@@ -3910,38 +4349,9 @@ fn call_button(
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = if self.profile.is_none() {
-            div()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .items_center()
-                .size_full()
-                .bg(theme::background())
-                .text_color(theme::foreground())
-                .child(self.render_profile_setup(cx))
-                .into_any_element()
+            self.render_profile_setup(cx).into_any_element()
         } else if self.servers.is_empty() && matches!(self.screen, Screen::Home) {
-            // The error line hides while the modal is up — the modal card
-            // shows it inline instead.
-            let error = (!self.add_server_open)
-                .then(|| self.error.clone())
-                .flatten()
-                .map(|message| div().text_size(px(12.5)).text_color(theme::destructive_foreground()).child(message));
-
-            div()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .justify_center()
-                .items_center()
-                .size_full()
-                .p(px(24.))
-                .bg(theme::background())
-                .text_color(theme::foreground())
-                .child(div().text_size(px(19.)).font_weight(FontWeight::BOLD).child("corcel"))
-                .child(self.render_home_empty_state(cx))
-                .children(error)
-                .into_any_element()
+            self.render_arrival(cx).into_any_element()
         } else {
             self.render_app_shell(cx)
         };

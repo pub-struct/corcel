@@ -154,7 +154,6 @@ pub fn pill(variant: PillVariant, label: impl Into<SharedString>) -> Div {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonVariant {
     Primary,
-    Secondary,
     Ghost,
 }
 
@@ -175,12 +174,6 @@ pub fn button(variant: ButtonVariant, label: impl Into<SharedString>) -> Div {
             .bg(primary())
             .text_color(primary_foreground())
             .hover(|style| style.bg(primary_hover())),
-        ButtonVariant::Secondary => base
-            .bg(wash())
-            .text_color(foreground())
-            .border_1()
-            .border_color(input_border())
-            .hover(|style| style.bg(wash_strong())),
         ButtonVariant::Ghost => base
             .text_color(muted_foreground())
             .hover(|style| style.bg(wash()).text_color(foreground())),

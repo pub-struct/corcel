@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, InspectorElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, point, prelude::*, px, relative, rgba, size,
@@ -48,6 +48,10 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// Renders as a big borderless "hero" field (large type over a single
+    /// underline that lights up with focus) instead of the boxed default —
+    /// for onboarding screens where the input *is* the page, not a form row.
+    hero: bool,
 }
 
 impl TextInput {
@@ -62,7 +66,14 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            hero: false,
         }
+    }
+
+    pub fn new_hero(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::new(placeholder, cx);
+        input.hero = true;
+        input
     }
 
     /// Empties the input, resetting the cursor with it — callers must not
@@ -537,8 +548,8 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let base = div()
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
@@ -559,21 +570,34 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(theme::card())
-            .border_1()
-            .border_color(theme::input_border())
-            .rounded_lg() // --radius-md (8px)
-            .line_height(px(20.))
-            .text_size(px(14.))
-            .w_full()
-            .child(
-                div()
-                    .h(px(20. + 10. * 2.))
-                    .w_full()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .child(TextElement { input: cx.entity() }),
-            )
+            .w_full();
+
+        if self.hero {
+            let focused = self.focus_handle.is_focused(window);
+            base.border_b_2()
+                .border_color(if focused { theme::ring() } else { theme::input_border() })
+                .line_height(px(34.))
+                .text_size(px(26.))
+                .font_weight(FontWeight::BOLD)
+                .child(
+                    div().h(px(34. + 6. * 2.)).w_full().py(px(6.)).child(TextElement { input: cx.entity() }),
+                )
+        } else {
+            base.bg(theme::card())
+                .border_1()
+                .border_color(theme::input_border())
+                .rounded_lg() // --radius-md (8px)
+                .line_height(px(20.))
+                .text_size(px(14.))
+                .child(
+                    div()
+                        .h(px(20. + 10. * 2.))
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .child(TextElement { input: cx.entity() }),
+                )
+        }
     }
 }
 
