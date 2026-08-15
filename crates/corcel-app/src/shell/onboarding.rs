@@ -542,14 +542,14 @@ impl Shell {
                     "arrival-create",
                     linear_gradient(
                         135.,
-                        linear_color_stop(rgba(0x5865f2ff), 0.),
-                        linear_color_stop(rgba(0x2b2168ff), 1.),
+                        linear_color_stop(rgba(0x16283aff), 0.),
+                        linear_color_stop(rgba(0x0e151dff), 1.),
                     ),
                     icons::PLUS,
                     "Create your own",
                     "Host a server on this machine — a #general to talk in, a voice room to hang in, an invite link to hand out.",
                     "Start fresh →",
-                    rgba(0x949cf7ff),
+                    rgba(0x54a9ffff),
                 )
                 .on_mouse_up(
                     MouseButton::Left,
@@ -561,14 +561,14 @@ impl Shell {
                     "arrival-join",
                     linear_gradient(
                         135.,
-                        linear_color_stop(rgba(0x23a55aff), 0.),
-                        linear_color_stop(rgba(0x00a8fcff), 1.),
+                        linear_color_stop(rgba(0x15301fff), 0.),
+                        linear_color_stop(rgba(0x0d1712ff), 1.),
                     ),
                     icons::LINK,
                     "Join your friends",
                     "Someone sent you an invite link? Paste it and you're standing in their server a second later.",
                     "I have an invite →",
-                    rgba(0x3dc06cff),
+                    rgba(0x2ec06cff),
                 )
                 .on_mouse_up(
                     MouseButton::Left,
@@ -592,10 +592,10 @@ impl Shell {
                 // server will get, updating per keystroke — name it and
                 // *watch* it become real.
                 let preview = div()
-                    .rounded_lg()
-                    .bg(theme::rail())
+                    .rounded(px(12.))
+                    .bg(theme::wash())
                     .border_1()
-                    .border_color(theme::border())
+                    .border_color(theme::glass_edge())
                     .p(px(14.))
                     .flex()
                     .items_center()
@@ -846,10 +846,10 @@ impl Shell {
             .flex_col()
             .gap(px(18.))
             .p(px(24.))
-            .bg(theme::popover())
+            .bg(theme::raised_fill())
             .border_1()
-            .border_color(theme::border())
-            .rounded_xl() // --radius-xl (14px, nearest preset)
+            .border_color(theme::glass_edge())
+            .rounded(px(16.)) // coss card radius
             .shadow_lg()
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::close_add_server_clicked))
             .child(
@@ -869,7 +869,12 @@ impl Shell {
                 Animation::new(Duration::from_millis(280)).with_easing(ease_out_quint()),
                 |stage, delta| stage.opacity(delta),
             ))
-            .children(error);
+            .children(error)
+            .with_animation(
+                "add-server-in",
+                Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                |card, delta| card.opacity(delta).mt(px(14. * (1. - delta))),
+            );
 
         div()
             .size_full()
@@ -920,7 +925,7 @@ pub(super) fn reach_option_row(
 ) -> Stateful<Div> {
     let row = div()
         .id(id)
-        .rounded_lg()
+        .rounded(px(10.))
         .border_1()
         .p(px(12.))
         .flex()
@@ -962,9 +967,9 @@ pub(super) fn reach_option_row(
                 ),
         );
     if selected {
-        row.border_color(theme::ring()).bg(theme::wash())
+        row.border_color(theme::ring()).bg(theme::wash_strong())
     } else {
-        row.border_color(theme::border()).hover(|style| style.bg(theme::wash()))
+        row.border_color(theme::glass_edge()).bg(theme::wash()).hover(|style| style.bg(theme::wash_strong()))
     }
 }
 
@@ -984,24 +989,32 @@ pub(super) fn arrival_choice_card(
     div()
         .id(id)
         .w(px(264.))
-        .rounded_xl()
+        .rounded(px(16.))
         .overflow_hidden()
-        .bg(theme::card())
+        .bg(theme::wash())
         .border_1()
-        .border_color(theme::border())
+        .border_color(theme::glass_edge())
+        .shadow_md()
         .cursor_pointer()
-        .hover(|style| style.border_color(theme::ring()).bg(theme::wash()))
+        .hover(|style| style.border_color(theme::ring()).bg(theme::wash_strong()))
         .active(|style| style.opacity(0.92))
         .child(
-            div().h(px(112.)).w_full().rounded_t_xl().bg(art).flex().items_center().justify_center().child(
+            div().h(px(112.)).w_full().rounded_t(px(15.)).bg(art).flex().items_center().justify_center().child(
                 div()
-                    .size(px(52.))
+                    .size(px(56.))
                     .rounded_full()
-                    .bg(rgba(0xffffff2b))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(theme::icon(icon_path, px(24.)).text_color(rgba(0xffffffff))),
+                    .p(px(1.))
+                    .bg(theme::bevel_ring())
+                    .child(
+                        div()
+                            .size_full()
+                            .rounded_full()
+                            .bg(theme::wash_strong())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(theme::icon(icon_path, px(26.)).text_color(theme::foreground())),
+                    ),
             ),
         )
         .child(
