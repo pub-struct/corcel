@@ -1775,7 +1775,23 @@ impl Shell {
     /// replies below, and a composer of its own — the channel stays
     /// visible and usable to its left.
     fn render_thread_panel(&mut self, root: ChatMessage, profile: &Profile, cx: &mut Context<Self>) -> Div {
-        let render_entry = |shell: &Self, message: &ChatMessage, is_root: bool| {
+        // Same media pipeline as the channel: embeds built up front (they
+        // need &mut self), bodies rendered through richtext with the
+        // embedded URLs hidden — a bare GIF link becomes just the GIF.
+        let mut embeds: HashMap<Uuid, Vec<gpui::AnyElement>> = HashMap::new();
+        let mut embedded_urls: HashMap<Uuid, Vec<String>> = HashMap::new();
+        let bodies: Vec<(Uuid, String)> = std::iter::once(&root)
+            .chain(self.thread_messages.iter())
+            .filter(|message| !message.deleted)
+            .map(|message| (message.id, message.body.clone()))
+            .collect();
+        for (id, body) in bodies {
+            let (elements, urls) = self.render_message_embeds(&body, cx);
+            embeds.insert(id, elements);
+            embedded_urls.insert(id, urls);
+        }
+
+        let mut render_entry = |shell: &Self, message: &ChatMessage, is_root: bool| {
             let is_self = message.author == profile.name;
             let avatar = if is_self {
                 profile.avatar_path.clone()
@@ -1797,8 +1813,10 @@ impl Shell {
                     .child("message deleted")
                     .into_any_element()
             } else {
-                div().text_size(px(13.5)).child(message.body.clone()).into_any_element()
+                let hidden = embedded_urls.get(&message.id).map(Vec::as_slice).unwrap_or(&[]);
+                richtext::render_body(message.id.as_u128() as u64, &message.body, hidden)
             };
+            let media = embeds.remove(&message.id).unwrap_or_default();
             div()
                 .px(px(12.))
                 .py(px(6.))
@@ -1835,7 +1853,8 @@ impl Shell {
                                         .child(format_timestamp(message.sent_at)),
                                 ),
                         )
-                        .child(body),
+                        .child(body)
+                        .child(div().max_w_full().overflow_hidden().rounded_lg().flex().flex_col().children(media)),
                 )
         };
 
