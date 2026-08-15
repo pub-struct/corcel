@@ -480,36 +480,6 @@ impl Shell {
             .filter(|call| call.channel.id == channel.id)
             .map(|call| &call.status);
 
-        let pill_el = match status {
-            Some(ChannelStatus::Connecting) => theme::pill(theme::PillVariant::Connecting, "Connecting…"),
-            Some(ChannelStatus::Connected(_)) => theme::pill(theme::PillVariant::Live, "Voice connected"),
-            Some(ChannelStatus::Failed(_)) => theme::pill(theme::PillVariant::Failed, "Connection failed"),
-            None => theme::pill(theme::PillVariant::Connecting, "Not connected"),
-        };
-
-        let header = div()
-            .h(px(48.))
-            .flex_none()
-            .px(px(12.))
-            .border_b_1()
-            .border_color(theme::border())
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(theme::icon(icons::VOLUME, px(18.)).text_color(theme::muted_foreground()))
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .font_weight(FontWeight::BOLD)
-                    .text_size(px(15.))
-                    .child(channel.name.clone()),
-            )
-            .child(div().flex_1())
-            .child(pill_el);
-
         let stage_content = match status {
             Some(ChannelStatus::Connecting) => div()
                 .size_full()
@@ -872,7 +842,7 @@ impl Shell {
             .children(control_bar)
             .children(quality_menu);
 
-        div().flex_1().min_w_0().h_full().flex().flex_col().child(header).child(stage)
+        div().flex_1().min_w_0().h_full().flex().flex_col().child(stage)
     }
 
 }

@@ -23,7 +23,7 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, Background, ClipboardItem, Context, Div, Entity, Focusable, FontWeight,
     ImageSource, KeyDownEvent, KeyUpEvent, MouseButton, MouseUpEvent, ObjectFit, PathPromptOptions, Render,
     RenderImage, Rgba, ScrollHandle, SharedString, Stateful, Transformation, Window, deferred, div, ease_out_quint,
-    img, linear_color_stop, linear_gradient, prelude::*, px, radians, relative, rgba,
+    img, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -123,32 +123,26 @@ impl Render for VideoSurface {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match self.frames.len() {
             count if count > 0 => {
-                // 1 feed fills the stage; 2 sit side by side; 3-4 quarter
-                // it. (More than 4 video feeds at friends scale means
-                // someone is showing off; they wrap into the same grid.)
-                let (tile_w, tile_h) = match count {
-                    1 => (1.0, 1.0),
-                    2 => (0.5, 1.0),
-                    _ => (0.5, 0.5),
-                };
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_center()
-                    .children(self.frames.iter().map(|(_, frame)| {
-                        div()
-                            .w(relative(tile_w))
-                            .h(relative(tile_h))
-                            .p(px(2.))
-                            .child(
+                // Explicit rows of at most two tiles, every row and tile
+                // flex_1 — sizes come from flex distribution, never from
+                // percentage math (50% + 50% could round past the parent,
+                // wrap, and paint one feed over another). One feed fills
+                // the stage; two split it; more stack rows of two.
+                let columns = if count == 1 { 1 } else { 2 };
+                let rows: Vec<_> = self
+                    .frames
+                    .chunks(columns)
+                    .map(|row| {
+                        div().flex_1().min_h_0().flex().children(row.iter().map(|(_, frame)| {
+                            div().flex_1().min_w_0().p(px(2.)).child(
                                 img(ImageSource::Render(frame.clone()))
                                     .size_full()
                                     .object_fit(ObjectFit::Contain),
                             )
-                    }))
-                    .into_any_element()
+                        }))
+                    })
+                    .collect();
+                div().size_full().flex().flex_col().children(rows).into_any_element()
             }
             _ => div()
                 .size_full()
