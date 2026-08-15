@@ -6,6 +6,7 @@
 
 use std::io::Read;
 
+use gpui::ElementId;
 use image::AnimationDecoder;
 
 use super::*;
@@ -292,6 +293,10 @@ fn image_card(url: String, image: Arc<RenderImage>, cx: &mut Context<Shell>) -> 
     let size = image.size(0);
     let (width, height) = (size.width.0.max(1) as f32, size.height.0.max(1) as f32);
     let scale = (EMBED_MAX_WIDTH / width).min(EMBED_MAX_HEIGHT / height).min(1.);
+    // The img element only animates (advances GIF frames + requests the
+    // next redraw) when it has an element id to keep frame state under —
+    // an anonymous img renders frame 0 forever.
+    let id: ElementId = SharedString::from(format!("embed-img-{url}")).into();
     div()
         .w(px(width * scale))
         .h(px(height * scale))
@@ -302,7 +307,7 @@ fn image_card(url: String, image: Arc<RenderImage>, cx: &mut Context<Shell>) -> 
         .border_color(theme::border())
         .cursor_pointer()
         .on_mouse_up(MouseButton::Left, cx.listener(move |_shell, _, _window, cx| cx.open_url(&url)))
-        .child(img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Contain))
+        .child(img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Contain).id(id))
         .into_any_element()
 }
 
