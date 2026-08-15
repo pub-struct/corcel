@@ -34,39 +34,56 @@ pub struct Store {
     conn: Connection,
 }
 
+/// The schema, as an append-only list of migrations. `PRAGMA user_version`
+/// records how many have run; opening walks the tail. Rules: **never edit a
+/// shipped migration** (databases that already ran it will never see the
+/// edit) — append a new one. Migration 1 uses `IF NOT EXISTS` because it
+/// adopts databases created before versioning existed.
+const MIGRATIONS: &[&str] = &[
+    // 1: the original schema — servers this user belongs to + all messages.
+    "CREATE TABLE IF NOT EXISTS servers (
+        id        TEXT PRIMARY KEY,
+        link      TEXT NOT NULL,
+        is_host   INTEGER NOT NULL,
+        cert_der  BLOB,
+        key_der   BLOB,
+        position  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+        id         TEXT PRIMARY KEY,
+        server_id  TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        author     TEXT NOT NULL,
+        sent_at    INTEGER NOT NULL,
+        body       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS messages_by_channel
+        ON messages (channel_id, sent_at);
+    CREATE INDEX IF NOT EXISTS messages_by_server_time
+        ON messages (server_id, sent_at);",
+];
+
 impl Store {
     /// Opens (creating if needed) the app database and brings the schema up
-    /// to date. The schema is tiny enough that "create if missing" *is* the
-    /// migration story for now.
+    /// to date by running whatever tail of [`MIGRATIONS`] this database
+    /// hasn't seen, each in its own transaction.
     pub fn open() -> anyhow::Result<Self> {
         let path = db_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path)
+        let mut conn = Connection::open(&path)
             .with_context(|| format!("couldn't open database at {}", path.display()))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS servers (
-                id        TEXT PRIMARY KEY,
-                link      TEXT NOT NULL,
-                is_host   INTEGER NOT NULL,
-                cert_der  BLOB,
-                key_der   BLOB,
-                position  INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id         TEXT PRIMARY KEY,
-                server_id  TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                author     TEXT NOT NULL,
-                sent_at    INTEGER NOT NULL,
-                body       TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS messages_by_channel
-                ON messages (channel_id, sent_at);
-            CREATE INDEX IF NOT EXISTS messages_by_server_time
-                ON messages (server_id, sent_at);",
-        )?;
+
+        let version: usize =
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
+        for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
+            let tx = conn.transaction()?;
+            tx.execute_batch(migration)
+                .with_context(|| format!("schema migration {} failed", index + 1))?;
+            tx.pragma_update(None, "user_version", (index + 1) as i64)?;
+            tx.commit()?;
+        }
         Ok(Self { conn })
     }
 

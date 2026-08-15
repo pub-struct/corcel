@@ -8,6 +8,7 @@ mod store;
 mod text_input;
 mod theme;
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -179,11 +180,13 @@ struct ActiveCall {
     status: ChannelStatus,
 }
 
-/// The active server's chat-room connection — see [`Shell::connect_chat`].
-/// Only the *active* server holds an open room; switching servers replaces
-/// this (bumping `Shell::chat_generation` so the old pump task stops —
-/// which is also why no server id is stored here: the generation already
-/// says which room this is).
+/// One server's live chat-room connection — see [`Shell::connect_chat`].
+/// *Every* saved server keeps a room open for the app's whole lifetime
+/// (reconnecting with backoff when it drops), because replication must not
+/// depend on which server happens to be on screen: messages for background
+/// servers land in the database as they arrive, and this user serves
+/// history to peers for all their servers — "every user is a host" only
+/// holds if membership, not focus, is what keeps the connection alive.
 struct ChatRoom {
     outbound: mpsc::UnboundedSender<ClientMessage>,
 }
@@ -240,11 +243,15 @@ struct Shell {
     servers: Vec<SavedServer>,
     screen: Screen,
     call: Option<ActiveCall>,
-    chat: Option<ChatRoom>,
-    /// Bumped every time the active chat room changes (or should die), so
-    /// in-flight connect attempts and pump loops from a previous room can
-    /// detect they're stale and stop touching the shell.
-    chat_generation: u64,
+    /// Connected chat rooms, one per saved server (see [`ChatRoom`]).
+    /// Absence means "reconnecting" — a [`Shell::connect_chat`] loop is
+    /// always alive for every saved server.
+    rooms: HashMap<Uuid, ChatRoom>,
+    /// Per-server generation counters. Bumped whenever a server's room
+    /// should be replaced (reconnect with fresh address) or die (leaving
+    /// the server), so in-flight connect attempts and pump loops can detect
+    /// they're stale and stop touching the shell.
+    room_generations: HashMap<Uuid, u64>,
     /// The messages of the text channel currently on screen, loaded from the
     /// store and appended to live. Cleared/reloaded on channel switch.
     chat_messages: Vec<ChatMessage>,
@@ -276,8 +283,8 @@ impl Shell {
             servers,
             screen: Screen::Home,
             call: None,
-            chat: None,
-            chat_generation: 0,
+            rooms: HashMap::new(),
+            room_generations: HashMap::new(),
             chat_messages: Vec::new(),
             chat_scroll: ScrollHandle::new(),
             message_input: cx.new(|cx| TextInput::new("Send a message…", cx)),
@@ -289,6 +296,11 @@ impl Shell {
         };
 
         shell.start_rehosts(cx);
+        // Every saved server gets its chat room immediately — background
+        // servers replicate too (see [`ChatRoom`]).
+        for id in shell.servers.iter().map(|server| server.link.id).collect::<Vec<_>>() {
+            shell.connect_chat(id, cx);
+        }
         // Land the user back in the server they'd expect instead of an
         // empty Home — the first one in the rail.
         if let Some(id) = shell.servers.first().map(|server| server.link.id) {
@@ -328,13 +340,10 @@ impl Shell {
                     if let Some(store) = &shell.store {
                         let _ = store.update_link(&new_link);
                     }
-                    // If this server is on screen and its chat gave up while
-                    // the relay was still coming up, try again now.
-                    if shell.chat.is_none()
-                        && matches!(&shell.screen, Screen::Server { id, .. } if *id == new_link.id)
-                    {
-                        shell.connect_chat(new_link.id, cx);
-                    }
+                    // Restart the room loop so it picks up the (possibly
+                    // new) address immediately instead of waiting out
+                    // whatever backoff its current attempt is sleeping in.
+                    shell.connect_chat(new_link.id, cx);
                     cx.notify();
                 });
             })
@@ -432,6 +441,7 @@ impl Shell {
                         shell.servers.push(server);
                         shell.add_server_open = false;
                         shell.server_name_input.update(cx, |input, cx| input.clear(cx));
+                        shell.connect_chat(id, cx);
                         shell.open_server(id, cx);
                     }
                     Ok(Err(err)) => shell.error = Some(format!("failed to host server: {err:#}")),
@@ -469,6 +479,7 @@ impl Shell {
                 self.add_server_open = false;
                 self.error = None;
                 self.join_link_input.update(cx, |input, cx| input.clear(cx));
+                self.connect_chat(id, cx);
                 self.open_server(id, cx);
             }
             Err(err) => self.error = Some(format!("invalid invite link: {err:#}")),
@@ -507,8 +518,10 @@ impl Shell {
                 self.call = None;
             }
         }
-        self.chat_generation += 1;
-        self.chat = None;
+        // Bumping the generation without restarting a loop is how a room
+        // dies for good: the pump sees the mismatch and returns.
+        *self.room_generations.entry(id).or_insert(0) += 1;
+        self.rooms.remove(&id);
         self.chat_messages.clear();
         if let Some(store) = &self.store {
             let _ = store.remove_server(id);
@@ -526,8 +539,9 @@ impl Shell {
     }
 
     /// Switches the shell to a server (rail click, or right after
-    /// hosting/joining one). The current voice call — possibly in another
-    /// server — keeps running; only the chat room is per-active-server.
+    /// hosting/joining one). Pure view change — every saved server's chat
+    /// room is already alive (see [`ChatRoom`]), and the current voice call
+    /// (possibly in another server) keeps running.
     fn open_server(&mut self, id: Uuid, cx: &mut Context<Self>) {
         if matches!(&self.screen, Screen::Server { id: current, .. } if *current == id) {
             return;
@@ -535,7 +549,6 @@ impl Shell {
         self.screen = Screen::Server { id, view: ServerView::Lobby };
         self.chat_messages.clear();
         self.error = None;
-        self.connect_chat(id, cx);
         cx.notify();
     }
 
@@ -551,80 +564,111 @@ impl Shell {
 
     // ---- Chat ----------------------------------------------------------
 
-    /// Opens (or re-opens) the active server's chat room: the long-lived
-    /// relay connection that carries message broadcasts and history
-    /// exchanges (see [`chat`] for the replication scheme). Retries a few
-    /// times because on launch the host's own relay may still be respawning
-    /// ([`Self::start_rehosts`]); if it never connects, chat quietly stays
-    /// read-only-from-local-history — local first, the network is optional.
+    fn room_generation(&self, server_id: Uuid) -> u64 {
+        self.room_generations.get(&server_id).copied().unwrap_or(0)
+    }
+
+    /// Starts (or restarts) a server's chat-room loop: the long-lived relay
+    /// connection that carries message broadcasts and history exchanges
+    /// (see [`chat`] for the replication scheme). The loop never gives up —
+    /// it reconnects with backoff for as long as the server stays saved,
+    /// because hosts restart and laptops sleep. Until it connects, chat
+    /// quietly stays read-only-from-local-history — local first, the
+    /// network is optional.
     fn connect_chat(&mut self, server_id: Uuid, cx: &mut Context<Self>) {
-        let Some(server) = self.servers.iter().find(|s| s.link.id == server_id) else { return };
-        // The host reaches its own relay over loopback — its link carries
-        // the LAN address, which some networks won't hairpin back.
-        let addr = if server.is_host {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server.link.addr.port())
-        } else {
-            server.link.addr
+        let generation = {
+            let entry = self.room_generations.entry(server_id).or_insert(0);
+            *entry += 1;
+            *entry
         };
-        let fingerprint = server.link.fingerprint;
-        self.chat_generation += 1;
-        let generation = self.chat_generation;
-        self.chat = None;
+        self.rooms.remove(&server_id);
 
         cx.spawn(async move |this, cx| {
-            let mut conn = None;
-            for attempt in 0..5 {
+            // Fast burst first (on launch the host's own relay may still be
+            // respawning — see start_rehosts), then patient forever.
+            const BACKOFF_SECS: &[u64] = &[1, 1, 1, 1, 1, 5, 15, 60];
+            // Where a *re*connect resumes in the schedule: skip the startup
+            // burst, a dropped connection warrants patience, not hammering.
+            const RECONNECT_ATTEMPT: usize = 6;
+            let mut attempt = 0usize;
+            loop {
                 if attempt > 0 {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let delay = BACKOFF_SECS[(attempt - 1).min(BACKOFF_SECS.len() - 1)];
+                    cx.background_executor().timer(Duration::from_secs(delay)).await;
                 }
-                let still_wanted = this.update(cx, |shell, _| shell.chat_generation == generation);
-                if !matches!(still_wanted, Ok(true)) {
-                    return;
-                }
-                if let Ok(Ok(connection)) =
+                attempt += 1;
+
+                // Re-read the address every attempt — a rehost may have
+                // moved the relay to a new port while we were backing off.
+                // The host reaches its own relay over loopback: its link
+                // carries the LAN address, which some networks won't
+                // hairpin back.
+                let target = this.update(cx, |shell, _| {
+                    if shell.room_generation(server_id) != generation {
+                        return None;
+                    }
+                    shell.servers.iter().find(|s| s.link.id == server_id).map(|server| {
+                        let addr = if server.is_host {
+                            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server.link.addr.port())
+                        } else {
+                            server.link.addr
+                        };
+                        (addr, server.link.fingerprint)
+                    })
+                });
+                let Ok(Some((addr, fingerprint))) = target else { return };
+
+                let Ok(Ok(mut conn)) =
                     runtime::spawn_and_send(session::open_room(addr, fingerprint, server_id)).await
-                {
-                    conn = Some(connection);
-                    break;
-                }
-            }
-            let Some(mut conn) = conn else { return };
+                else {
+                    continue;
+                };
 
-            let outbound = conn.outbound.clone();
-            let registered = this.update(cx, |shell, cx| {
-                if shell.chat_generation != generation {
-                    return false;
-                }
-                shell.chat = Some(ChatRoom { outbound });
-                cx.notify();
-                true
-            });
-            if !matches!(registered, Ok(true)) {
-                return;
-            }
-
-            // The pump: every room event lands here until the connection
-            // drops or the shell moves on to another server (generation
-            // mismatch). `recv` is just a future, so it works fine on the
-            // GPUI executor even though the channel is fed from tokio.
-            while let Some(message) = conn.inbound.recv().await {
-                let keep_going = this.update(cx, |shell, cx| {
-                    if shell.chat_generation != generation {
+                let outbound = conn.outbound.clone();
+                let registered = this.update(cx, |shell, cx| {
+                    if shell.room_generation(server_id) != generation {
                         return false;
                     }
-                    shell.handle_room_message(server_id, message, cx);
+                    shell.rooms.insert(server_id, ChatRoom { outbound });
+                    cx.notify();
                     true
                 });
-                if !matches!(keep_going, Ok(true)) {
+                if !matches!(registered, Ok(true)) {
                     return;
                 }
-            }
-            let _ = this.update(cx, |shell, cx| {
-                if shell.chat_generation == generation {
-                    shell.chat = None;
-                    cx.notify();
+
+                // The pump: every room event lands here until the
+                // connection drops or the room is superseded (generation
+                // mismatch). `recv` is just a future, so it works fine on
+                // the GPUI executor even though the channel is fed from
+                // tokio.
+                while let Some(message) = conn.inbound.recv().await {
+                    let keep_going = this.update(cx, |shell, cx| {
+                        if shell.room_generation(server_id) != generation {
+                            return false;
+                        }
+                        shell.handle_room_message(server_id, message, cx);
+                        true
+                    });
+                    if !matches!(keep_going, Ok(true)) {
+                        return;
+                    }
                 }
-            });
+
+                // Connection dropped — forget the room and go around again.
+                let still_current = this.update(cx, |shell, cx| {
+                    if shell.room_generation(server_id) != generation {
+                        return false;
+                    }
+                    shell.rooms.remove(&server_id);
+                    cx.notify();
+                    true
+                });
+                if !matches!(still_current, Ok(true)) {
+                    return;
+                }
+                attempt = RECONNECT_ATTEMPT;
+            }
         })
         .detach();
     }
@@ -642,7 +686,7 @@ impl Shell {
                     .and_then(|store| store.latest_timestamp(server_id).ok().flatten())
                     .map(|latest| latest - chat::HISTORY_OVERLAP_MILLIS)
                     .unwrap_or(0);
-                self.send_room(ChatPayload::HistoryRequest { since }, Some(peer));
+                self.send_room(server_id, ChatPayload::HistoryRequest { since }, Some(peer));
             }
             ServerMessage::Published { payload, .. } => {
                 if let Ok(ChatPayload::Message(message)) = serde_json::from_value(payload) {
@@ -656,7 +700,7 @@ impl Shell {
                 Ok(ChatPayload::HistoryRequest { since }) => {
                     let Some(store) = &self.store else { return };
                     let Ok(messages) = store.messages_since(server_id, since) else { return };
-                    self.send_room(ChatPayload::HistoryBatch { messages }, Some(from));
+                    self.send_room(server_id, ChatPayload::HistoryBatch { messages }, Some(from));
                 }
                 Ok(ChatPayload::HistoryBatch { messages }) => self.absorb_messages(server_id, messages, cx),
                 Ok(ChatPayload::Message(message)) => self.absorb_messages(server_id, vec![message], cx),
@@ -666,14 +710,14 @@ impl Shell {
         }
     }
 
-    fn send_room(&self, payload: ChatPayload, to: Option<PeerId>) {
-        let Some(chat) = &self.chat else { return };
+    fn send_room(&self, server_id: Uuid, payload: ChatPayload, to: Option<PeerId>) {
+        let Some(room) = self.rooms.get(&server_id) else { return };
         let Ok(payload) = serde_json::to_value(&payload) else { return };
         let message = match to {
             Some(to) => ClientMessage::Direct { to, payload },
             None => ClientMessage::Publish { payload },
         };
-        let _ = chat.outbound.send(message);
+        let _ = room.outbound.send(message);
     }
 
     /// Stores received messages (deduped by id — see
@@ -724,7 +768,7 @@ impl Shell {
         if let Some(store) = &self.store {
             let _ = store.insert_message(server_id, &message);
         }
-        self.send_room(ChatPayload::Message(message.clone()), None);
+        self.send_room(server_id, ChatPayload::Message(message.clone()), None);
         self.chat_messages.push(message);
         self.message_input.update(cx, |input, cx| input.clear(cx));
         self.chat_scroll.scroll_to_bottom();
