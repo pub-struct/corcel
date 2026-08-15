@@ -1222,6 +1222,72 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
+name = "corcel-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "chrono",
+ "corcel-media",
+ "corcel-net",
+ "corcel-signal",
+ "gpui",
+ "image",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "unicode-segmentation",
+ "uuid",
+]
+
+[[package]]
+name = "corcel-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ashpd 0.13.13",
+ "bytes",
+ "corcel-net",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
+ "rtc",
+ "tokio",
+]
+
+[[package]]
+name = "corcel-net"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "corcel-signal",
+ "rtc",
+ "tokio",
+ "webrtc",
+]
+
+[[package]]
+name = "corcel-signal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "uuid",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2197,72 +2263,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "freecord-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "chrono",
- "freecord-media",
- "freecord-net",
- "freecord-signal",
- "gpui",
- "image",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "unicode-segmentation",
- "uuid",
-]
-
-[[package]]
-name = "freecord-media"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ashpd 0.13.13",
- "bytes",
- "freecord-net",
- "gstreamer",
- "gstreamer-app",
- "gstreamer-video",
- "rtc",
- "tokio",
-]
-
-[[package]]
-name = "freecord-net"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "freecord-signal",
- "rtc",
- "tokio",
- "webrtc",
-]
-
-[[package]]
-name = "freecord-signal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures-util",
- "rcgen",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "uuid",
 ]
 
 [[package]]

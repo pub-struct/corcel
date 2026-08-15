@@ -1,4 +1,4 @@
-# freecord UI Revamp — Design Brief
+# corcel UI Revamp — Design Brief
 
 The plan for the Phase-1.5 visual/interaction pass over the server rail, channel
 sidebar, and in-call view. Grounded in the classics — Don Norman's *The Design
@@ -46,7 +46,7 @@ Apple's design principles (instant feedback, purpose, familiarity, craft).
 ## The spec
 
 - **Icon system** — Lucide SVGs (ISC) embedded via a gpui `AssetSource`
-  (`assets.rs` + `crates/freecord-app/assets/icons/`), tinted by text color.
+  (`assets.rs` + `crates/corcel-app/assets/icons/`), tinted by text color.
   volume-2, mic, mic-off, video, video-off, monitor-up, phone, link, plus, x,
   users, log-out, user.
 - **Server rail** — pill indicator (hidden → 20px on hover → 40px active) flush
@@ -69,7 +69,7 @@ Apple's design principles (instant feedback, purpose, familiarity, craft).
 - **Perf fixes that ride along** (from the core-analysis pass): drop the old
   GPU texture when a new video frame replaces it (`cx.drop_image`); move the
   video frame into its own `VideoSurface` entity so 30fps frames stop
-  re-rendering the whole shell; single-copy RTP marshal in `freecord-media`.
+  re-rendering the whole shell; single-copy RTP marshal in `corcel-media`.
 
 ## Out of scope (unchanged)
 

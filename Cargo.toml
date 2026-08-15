@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/freecord-app",
-    "crates/freecord-signal",
-    "crates/freecord-net",
-    "crates/freecord-media",
+    "crates/corcel-app",
+    "crates/corcel-signal",
+    "crates/corcel-net",
+    "crates/corcel-media",
 ]
 
 [workspace.package]

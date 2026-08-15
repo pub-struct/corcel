@@ -1,4 +1,4 @@
-# freecord — Discord-features implementation plan
+# corcel — Discord-features implementation plan
 
 Ten features from the research pass, fully designed and ordered into five
 batches. Every design decision is already made here; an implementation pass
@@ -12,31 +12,31 @@ previous one's plumbing.
 
 Workspace crates and the files each batch touches:
 
-- `crates/freecord-app/src/main.rs` — the whole UI (`Shell` entity). Key
+- `crates/corcel-app/src/main.rs` — the whole UI (`Shell` entity). Key
   state: `servers: Vec<SavedServer>`, `screen: Screen { Home | Server { id,
   view: Lobby|Text|Voice } }`, `call: Option<ActiveCall>`, `chat:
   Option<ChatRoom>` + `chat_generation: u64`, `chat_messages:
   Vec<ChatMessage>`, `message_input: Entity<TextInput>`.
-- `crates/freecord-app/src/chat.rs` — `ChatMessage { id: Uuid, channel,
+- `crates/corcel-app/src/chat.rs` — `ChatMessage { id: Uuid, channel,
   author: String, sent_at: i64, body }`, `ChatPayload { Message,
   HistoryRequest { since }, HistoryBatch { messages } }` (serde
   `tag = "kind"`, snake_case), `HISTORY_OVERLAP_MILLIS`, `now_millis()`.
-- `crates/freecord-app/src/store.rs` — SQLite (`rusqlite` bundled), owned by
+- `crates/corcel-app/src/store.rs` — SQLite (`rusqlite` bundled), owned by
   the GPUI main thread only. Tables `servers`, `messages`. All replication
   convergence rests on `insert_message`'s idempotence.
-- `crates/freecord-app/src/session.rs` — `host`/`rehost`/`join`/
+- `crates/corcel-app/src/session.rs` — `host`/`rehost`/`join`/
   `join_as_host`/`open_room`; `CallSession { pc, remote_video, hang_up:
   watch::Sender<bool>, mute: watch::Sender<bool>, local_video }`.
   `attach_media` owns the mic-upload loop (drops packets while muted) and
   spawns one `AudioPlayback` per incoming audio track.
-- `crates/freecord-media/src/capture.rs` — GStreamer capture pipelines
+- `crates/corcel-media/src/capture.rs` — GStreamer capture pipelines
   (`microphone()` returns Opus RTP packets). `playback.rs` —
   `AudioPlayback` (RTP → speakers), `VideoPlayback`.
-- `crates/freecord-signal` — QUIC-over-TLS relay. Rooms already exist:
+- `crates/corcel-signal` — QUIC-over-TLS relay. Rooms already exist:
   `ClientMessage::{Room, Publish, Direct}` /
   `ServerMessage::{RoomWelcome, Published, Direct}` route opaque
   `serde_json::Value` payloads per server id.
-- `crates/freecord-app/src/text_input.rs` — custom `TextInput`; no change
+- `crates/corcel-app/src/text_input.rs` — custom `TextInput`; no change
   callback. Enter-to-send works by catching the bubbled `KeyDownEvent` on
   the composer wrapper — piggyback there for typing detection too.
 
@@ -314,7 +314,7 @@ backfill, replies quote correctly.
 
 ### 1. Speaking indicators
 
-- **Detection** (`freecord-media/capture.rs::microphone()`): insert
+- **Detection** (`corcel-media/capture.rs::microphone()`): insert
   GStreamer's `level` element (`audioconvert ! level interval=100000000 !
   …` before the Opus encoder) and watch bus messages for the `level`
   element's RMS; expose `speaking: watch::Receiver<bool>` on `Capture` —
