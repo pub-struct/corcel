@@ -816,7 +816,7 @@ impl Render for Shell {
             // crucially — every `deferred` overlay inherits these, so a
             // modal can never fall back to the window default (black text)
             // just because its own subtree forgot to set a color.
-            .bg(theme::background())
+            .bg(theme::aurora())
             .text_color(theme::foreground())
             .on_key_down(cx.listener(Self::root_key_down))
             .on_key_up(cx.listener(Self::root_key_up))

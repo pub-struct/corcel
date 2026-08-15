@@ -1,7 +1,8 @@
-//! Color and component tokens for corcel's Discord-inspired look: a
-//! three-tier dark surface hierarchy (rail < sidebar/card < main content,
-//! darkest to lightest) plus Discord's blurple/green/red accents, modeled on
-//! the real Discord client and the "Discord UI Kit" Figma community file.
+//! Color and component tokens for the "Corcel Glass" look: Discord's
+//! three-tier surface hierarchy (rail < sidebar/card < main content) kept
+//! for its UX, reskinned Frutiger-Aero-glass — translucent blue-slate
+//! surfaces over a system-blurred window, hairline light borders, azure
+//! gradient accents, matching the Nucleo Glass icon set.
 //!
 //! GPUI's `rounded_*` presets are a fixed rem scale (sm=4px, md=6px,
 //! lg=8px, xl=12px, 2xl=16px); each radius used below picks the nearest
@@ -11,52 +12,60 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyView, App, Context, Div, FontWeight, ImageSource, Pixels, Render, Rgba, SharedString, Stateful, Svg, Styled,
-    Window, div, img, prelude::*, px, rgb, svg,
+    Window, div, img, prelude::*, px, rgb, rgba, svg,
 };
 
 /// The server-icon rail's background — the darkest surface.
+// ── Corcel Glass ────────────────────────────────────────────────────
+// Frutiger-Aero-descended, matched to the Nucleo Glass icon set: deep
+// blue-slate surfaces with real translucency (the window background is
+// system-blurred — see main.rs), hairline white borders standing in for
+// glass edges, white-wash hovers instead of gray, and azure accents.
+// Alphas are deliberate: chrome (rail) is the most transparent, floating
+// surfaces (popover) the most opaque so text always stays readable.
+
 pub fn rail() -> Rgba {
-    rgb(0x1e1f22)
+    rgba(0x0c1019d9)
 }
 
 /// Channel sidebar / member list background — one step lighter than the
 /// rail.
 pub fn card() -> Rgba {
-    rgb(0x2b2d31)
+    rgba(0x151b28d9)
 }
 
 /// Elevated surfaces: modals, the call dock, hover profile cards.
 pub fn popover() -> Rgba {
-    rgb(0x232428)
+    rgba(0x1a2233ee)
 }
 
 /// Main content background (video panel, empty states) — the lightest of
 /// the three surfaces, matching Discord's chat pane.
 pub fn background() -> Rgba {
-    rgb(0x313338)
+    rgba(0x10151fdd)
 }
 
 /// Hover / active row background within a sidebar or list.
 pub fn wash() -> Rgba {
-    rgb(0x35373c)
+    rgba(0xffffff0d)
 }
 
 pub fn wash_strong() -> Rgba {
-    rgb(0x3f4248)
+    rgba(0xffffff1a)
 }
 
 pub fn border() -> Rgba {
-    rgb(0x1e1f22)
+    rgba(0xffffff14)
 }
 
 pub fn input_border() -> Rgba {
-    rgb(0x3f4147)
+    rgba(0xffffff24)
 }
 
 /// The focus-ring color, used for the one border that's meant to stand out
 /// — e.g. a field the user should notice.
 pub fn ring() -> Rgba {
-    rgb(0x949ba4)
+    rgba(0x6fc3ffcc)
 }
 
 pub fn foreground() -> Rgba {
@@ -74,11 +83,11 @@ pub fn faint_foreground() -> Rgba {
 /// Discord's blurple — the app's one brand accent, used sparingly (primary
 /// buttons, the active-server rail indicator).
 pub fn primary() -> Rgba {
-    rgb(0x5865f2)
+    rgb(0x2e8fff)
 }
 
 pub fn primary_hover() -> Rgba {
-    rgb(0x4752c4)
+    rgb(0x2374d8)
 }
 
 pub fn primary_foreground() -> Rgba {
@@ -95,7 +104,7 @@ pub fn destructive_foreground() -> Rgba {
 
 /// Online / connected-and-live green.
 pub fn success() -> Rgba {
-    rgb(0x23a55a)
+    rgb(0x2ec06c)
 }
 
 /// Screen-share / stream accent.
@@ -151,6 +160,27 @@ pub fn pill(variant: PillVariant, label: impl Into<SharedString>) -> Div {
         .child(label.into())
 }
 
+/// The glossy azure fill for primary actions — a vertical light-to-deep
+/// gradient, the same idiom as the icon set's glass layers.
+pub fn primary_gradient() -> gpui::Background {
+    gpui::linear_gradient(
+        180.,
+        gpui::linear_color_stop(gpui::rgba(0x54a9ffff), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x1e7be6ff), 1.),
+    )
+}
+
+/// The aurora ground the whole app sits on: a deep blue diagonal drift,
+/// visible wherever surfaces are translucent. Subtle on purpose — it
+/// tints the blur, it doesn't compete with content.
+pub fn aurora() -> gpui::Background {
+    gpui::linear_gradient(
+        150.,
+        gpui::linear_color_stop(gpui::rgba(0x14203add), 0.),
+        gpui::linear_color_stop(gpui::rgba(0x0b111bdd), 1.),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonVariant {
     Primary,
@@ -171,7 +201,10 @@ pub fn button(variant: ButtonVariant, label: impl Into<SharedString>) -> Div {
 
     match variant {
         ButtonVariant::Primary => base
-            .bg(primary())
+            .bg(primary_gradient())
+            .border_1()
+            .border_color(gpui::rgba(0xffffff38))
+            .shadow_md()
             .text_color(primary_foreground())
             .hover(|style| style.bg(primary_hover())),
         ButtonVariant::Ghost => base

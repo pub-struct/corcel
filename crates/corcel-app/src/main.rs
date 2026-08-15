@@ -102,6 +102,12 @@ fn main() {
                     // window is resizable (GPUI's default) up to whatever size
                     // the user wants above this floor.
                     window_min_size: Some(size(px(720.0), px(480.0))),
+                    // Corcel Glass: the compositor blurs whatever's behind
+                    // the window and the theme's translucent surfaces let
+                    // it tint through — real frosted glass on macOS (and
+                    // compositors that support it); platforms that don't
+                    // simply render the same palette opaque.
+                    window_background: gpui::WindowBackgroundAppearance::Blurred,
                     ..Default::default()
                 },
                 |_window, cx| cx.new(Shell::new),
